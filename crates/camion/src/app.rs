@@ -1,11 +1,14 @@
 use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use camion_core::RemotePath;
+
+use crate::screen::Screen;
 use camion_engine::engine::Command;
 use camion_engine::secrets::{EncryptedFile, InMemory, Keyring};
-use camion_engine::{Answer, Engine, Event, Question, SecretStore, SessionId};
+use camion_engine::{Answer, Engine, Event, Question, SessionId, Vault};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QString, QStringList};
 
@@ -59,6 +62,8 @@ pub mod qobject {
         #[qproperty(bool, question_is_secret)]
         #[qproperty(bool, question_is_grave)]
         #[qproperty(QString, question_accept)]
+        /// The third choice, when the question has one. Empty when it does not.
+        #[qproperty(QString, question_alternative)]
         type App = super::AppRust;
 
         #[qinvokable]
@@ -104,6 +109,11 @@ pub mod qobject {
 
         #[qinvokable]
         fn answer(self: Pin<&mut App>, accepted: bool, first: QString, second: QString);
+
+        /// Takes the question's third choice, for the questions that offer one.
+        #[qinvokable]
+        fn answer_alternative(self: Pin<&mut App>);
+
         #[qinvokable]
         fn dismiss_message(self: Pin<&mut App>);
 
@@ -141,16 +151,19 @@ pub struct AppRust {
     question_is_secret: bool,
     question_is_grave: bool,
     question_accept: QString,
+    question_alternative: QString,
 
     engine: Engine,
-    session: Option<SessionId>,
-    /// What the open session was opened from, which is what knows whether the desktop can
-    /// reach this destination on its own.
-    connection: Option<camion_engine::Connection>,
-    /// Where this connection's root sits on the server, as the server names it.
-    home: String,
-    folder: RemotePath,
-    pending: Option<Arc<Event>>,
+
+    /// What the window is showing. Every rule about it lives in [`Screen`], where it can be
+    /// tested; this object only copies the answers onto properties.
+    screen: Screen,
+    /// The questions waiting to be answered, oldest first.
+    ///
+    /// A queue rather than one slot: two connections opening at once ask two questions, and
+    /// overwriting the first would drop its prompt — which answers it by declining, so one of
+    /// the two connections would fail for no reason anybody could see.
+    pending: VecDeque<Arc<Event>>,
 }
 
 impl Default for AppRust {
@@ -179,13 +192,11 @@ impl Default for AppRust {
             question_is_secret: false,
             question_is_grave: false,
             question_accept: QString::default(),
+            question_alternative: QString::default(),
 
-            engine: Engine::start(secret_store(), crate::bus::emitter()),
-            session: None,
-            connection: None,
-            home: String::new(),
-            folder: RemotePath::root(),
-            pending: None,
+            engine: Engine::start(vault(), crate::bus::emitter()),
+            screen: Screen::default(),
+            pending: VecDeque::new(),
         }
     }
 }
@@ -195,19 +206,18 @@ impl Default for AppRust {
 /// The choice is made once at startup rather than per connection: it is a property of the
 /// machine, and a connection that works today should not start asking differently tomorrow
 /// because a daemon happened to be slow.
-fn secret_store() -> Arc<dyn SecretStore> {
+///
+/// The file is handed over locked. Opening it needs a passphrase, and the engine asks for that
+/// the first time a connection wants a credential — which is the first moment the question
+/// means anything, and the first moment there is a window to ask in.
+fn vault() -> Arc<Vault> {
     if Keyring::is_available() {
-        return Arc::new(Keyring);
+        return Arc::new(Vault::open(Arc::new(Keyring)));
     }
 
     match EncryptedFile::default_path() {
-        // The passphrase is asked for by the engine on the first connection that needs a
-        // secret, so an empty one here only ever opens an empty store.
-        Some(path) => match EncryptedFile::open(path, "") {
-            Ok(store) => Arc::new(store),
-            Err(_) => Arc::new(InMemory::default()),
-        },
-        None => Arc::new(InMemory::default()),
+        Some(path) => Arc::new(Vault::locked(path)),
+        None => Arc::new(Vault::open(Arc::new(InMemory::default()))),
     }
 }
 
@@ -219,7 +229,8 @@ impl cxx_qt::Initialize for qobject::App {
             let event = Arc::clone(event);
 
             crate::qt::queue(&thread, move |app| app.receive(event));
-        });
+        })
+        .forever();
 
         // `camion production-web` opens that connection straight away, which is what you want
         // from a launcher, a keybinding, or a terminal you are already standing in.
@@ -238,19 +249,19 @@ impl qobject::App {
             return;
         };
 
-        self.as_mut().rust_mut().connection = Some(connection.clone());
-        self.as_mut().set_connecting(true);
+        self.as_mut().rust_mut().screen.connecting_to(connection.clone());
+        self.as_mut().show();
         self.rust().engine.send(Command::Connect(Box::new(connection)));
     }
 
     pub fn disconnect(mut self: Pin<&mut Self>) {
-        if let Some(session) = self.rust().session {
+        if let Some(session) = self.rust().screen.session {
             self.as_mut().rust_mut().engine.send(Command::Disconnect(session));
         }
     }
 
     pub fn open(self: Pin<&mut Self>, name: QString) {
-        let folder = self.rust().folder.clone();
+        let folder = self.rust().screen.folder.clone();
 
         match folder.join(&name.to_string()) {
             Ok(path) => self.go_to(path),
@@ -266,7 +277,7 @@ impl qobject::App {
     }
 
     pub fn up(self: Pin<&mut Self>) {
-        if let Some(parent) = self.rust().folder.parent() {
+        if let Some(parent) = self.rust().screen.folder.parent() {
             self.go_to(parent);
         }
     }
@@ -303,7 +314,7 @@ impl qobject::App {
             return;
         }
 
-        let into = self.rust().folder.clone();
+        let into = self.rust().screen.folder.clone();
 
         self.command(move |session| Command::Upload { session, into, sources });
     }
@@ -318,7 +329,7 @@ impl qobject::App {
     }
 
     pub fn begin_move(mut self: Pin<&mut Self>, names: QStringList) {
-        let folder = QString::from(&self.rust().folder.to_string());
+        let folder = QString::from(&self.rust().screen.folder.to_string());
 
         // Worked out now rather than when the pointer reaches the edge: a drag that leaves the
         // window is taken over by the desktop, and by then there is no chance to add anything
@@ -361,9 +372,9 @@ impl qobject::App {
 
     /// The addresses of the named files, if the desktop speaks this destination's protocol.
     fn remote_urls(&self, names: &[String]) -> Option<QStringList> {
-        let destination = &self.rust().connection.as_ref()?.destination;
-        let folder = self.rust().folder.clone();
-        let home = self.rust().home.trim_end_matches('/').to_owned();
+        let destination = &self.rust().screen.connection.as_ref()?.destination;
+        let folder = self.rust().screen.folder.clone();
+        let home = self.rust().screen.home.trim_end_matches('/').to_owned();
         let mut urls = Vec::new();
 
         for name in names {
@@ -384,35 +395,58 @@ impl qobject::App {
         }
     }
 
-    pub fn answer(mut self: Pin<&mut Self>, accepted: bool, first: QString, second: QString) {
-        let pending = self.as_mut().rust_mut().pending.take();
+    pub fn answer(self: Pin<&mut Self>, accepted: bool, first: QString, second: QString) {
+        let answer = if !accepted {
+            Answer::Decline
+        } else if self.rust().question_wants_pair {
+            Answer::Pair { id: first.to_string(), secret: second.to_string() }
+        } else if self.rust().question_wants_text {
+            Answer::Text(first.to_string())
+        } else {
+            Answer::Accept
+        };
 
-        if let Some(Event::Ask(prompt)) = pending.as_deref() {
-            let answer = if !accepted {
-                Answer::Decline
-            } else if self.rust().question_wants_pair {
-                Answer::Pair {
-                    id: first.to_string(),
-                    secret: second.to_string(),
-                }
-            } else if self.rust().question_wants_text {
-                Answer::Text(first.to_string())
-            } else {
-                Answer::Accept
-            };
+        self.reply(answer);
+    }
 
+    /// Takes the question's third choice, for the questions that offer one.
+    pub fn answer_alternative(self: Pin<&mut Self>) {
+        self.reply(Answer::KeepBoth);
+    }
+
+    /// Answers the question on screen and moves on to whatever is behind it.
+    fn reply(mut self: Pin<&mut Self>, answer: Answer) {
+        let asked = self.as_mut().rust_mut().pending.pop_front();
+
+        if let Some(Event::Ask(prompt)) = asked.as_deref() {
             prompt.answer(answer);
         }
 
-        self.as_mut().set_asking(false);
+        self.ask_the_next_question();
+    }
+
+    /// Puts the oldest unanswered question on screen, or takes the dialog away when there are
+    /// none left.
+    fn ask_the_next_question(mut self: Pin<&mut Self>) {
+        let Some(waiting) = self.rust().pending.front().cloned() else {
+            self.as_mut().set_asking(false);
+            return;
+        };
+
+        if let Event::Ask(prompt) = waiting.as_ref() {
+            self.as_mut().pose(&prompt.question);
+            self.as_mut().set_asking(true);
+        }
     }
 
     pub fn dismiss_message(mut self: Pin<&mut Self>) {
-        self.as_mut().set_message(QString::default());
+        self.as_mut().rust_mut().screen.message = String::new();
+        self.show();
     }
 
     pub fn breadcrumb(&self) -> QStringList {
         self.rust()
+            .screen
             .folder
             .ancestors()
             .iter()
@@ -427,64 +461,48 @@ impl qobject::App {
     /// Sends a command for whichever connection is open. With none open there is nothing the
     /// interface could have asked for, so there is nothing to report either.
     fn command(&self, build: impl FnOnce(SessionId) -> Command) {
-        if let Some(session) = self.rust().session {
+        if let Some(session) = self.rust().screen.session {
             self.rust().engine.send(build(session));
         }
     }
 
     fn complain(mut self: Pin<&mut Self>, message: impl std::fmt::Display) {
-        self.as_mut().set_message(QString::from(&message.to_string()));
+        self.as_mut().rust_mut().screen.message = message.to_string();
+        self.show();
     }
 
     fn receive(mut self: Pin<&mut Self>, event: Arc<Event>) {
-        match event.as_ref() {
-            Event::Connected { session, label, capabilities, home } => {
-                self.as_mut().rust_mut().session = Some(*session);
-                self.as_mut().rust_mut().home = home.clone();
-                self.as_mut().set_connecting(false);
-                self.as_mut().set_connected(true);
-                self.as_mut().set_label(QString::from(label));
-                self.as_mut().set_can_rename(capabilities.rename.is_available());
-                self.as_mut()
-                    .set_rename_is_a_copy(capabilities.rename.needs_warning());
-                self.as_mut()
-                    .set_can_create_folder(capabilities.create_folder.is_available());
-            }
+        self.as_mut().rust_mut().screen.receive(&event);
+        self.as_mut().show();
 
-            Event::ConnectionFailed { reason, .. } => {
-                self.as_mut().set_connecting(false);
-                self.as_mut().complain(reason);
-            }
-
-            Event::Disconnected { .. } => {
-                self.as_mut().rust_mut().session = None;
-                self.as_mut().rust_mut().connection = None;
-                self.as_mut().rust_mut().home = String::new();
-                self.as_mut().set_connected(false);
-                self.as_mut().set_label(QString::default());
-                self.as_mut().rust_mut().folder = RemotePath::root();
-                self.as_mut().set_path(QString::from("/"));
-                self.as_mut().set_at_root(true);
-            }
-
-            Event::Listing { path, .. } => {
-                let at_root = path.is_root();
-
-                self.as_mut().rust_mut().folder = path.clone();
-                self.as_mut().set_path(QString::from(&path.to_string()));
-                self.as_mut().set_at_root(at_root);
-            }
-
-            Event::Failed { message } => self.as_mut().complain(message),
-
-            Event::Ask(prompt) => {
-                self.as_mut().pose(&prompt.question);
-                self.as_mut().rust_mut().pending = Some(Arc::clone(&event));
-                self.as_mut().set_asking(true);
-            }
-
-            _ => {}
+        if let Event::Ask(_) = event.as_ref() {
+            self.as_mut().rust_mut().pending.push_back(Arc::clone(&event));
+            self.ask_the_next_question();
         }
+    }
+
+    /// Copies what the window is showing onto the properties QML binds to.
+    ///
+    /// Assigned through the generated setters rather than replaced wholesale, so Qt emits a
+    /// change signal for what actually moved and nothing else redraws.
+    fn show(mut self: Pin<&mut Self>) {
+        let screen = &self.rust().screen;
+
+        let (connecting, connected) = (screen.connecting, screen.connected);
+        let (label, message) = (screen.label.clone(), screen.message.clone());
+        let (can_rename, is_a_copy) = (screen.can_rename, screen.rename_is_a_copy);
+        let can_create_folder = screen.can_create_folder;
+        let (path, at_root) = (screen.path(), screen.at_root());
+
+        self.as_mut().set_connecting(connecting);
+        self.as_mut().set_connected(connected);
+        self.as_mut().set_label(QString::from(&label));
+        self.as_mut().set_can_rename(can_rename);
+        self.as_mut().set_rename_is_a_copy(is_a_copy);
+        self.as_mut().set_can_create_folder(can_create_folder);
+        self.as_mut().set_path(QString::from(&path));
+        self.as_mut().set_at_root(at_root);
+        self.as_mut().set_message(QString::from(&message));
     }
 
     /// Turns a question from the engine into the words the dialog shows.
@@ -495,6 +513,8 @@ impl qobject::App {
         self.as_mut().set_question_body(QString::from(&asked.body));
         self.as_mut().set_question_detail(QString::from(&asked.detail));
         self.as_mut().set_question_accept(QString::from(&asked.accept));
+        self.as_mut()
+            .set_question_alternative(QString::from(&asked.alternative));
         self.as_mut().set_question_wants_text(asked.wants_text);
         self.as_mut().set_question_wants_pair(asked.wants_pair);
         self.as_mut()
@@ -510,6 +530,7 @@ struct Asked {
     title: String,
     body: String,
     detail: String,
+    alternative: String,
     accept: String,
     wants_text: bool,
     wants_pair: bool,
@@ -525,6 +546,7 @@ impl Default for Asked {
             title: String::new(),
             body: String::new(),
             detail: String::new(),
+            alternative: String::new(),
             accept: "Continue".to_owned(),
             wants_text: false,
             wants_pair: false,
@@ -604,6 +626,7 @@ fn describe(question: &Question) -> Asked {
             title: format!("Replace {name}?"),
             body: format!("{name} is already there."),
             accept: "Replace".to_owned(),
+            alternative: "Keep both".to_owned(),
             ..Asked::default()
         },
     }

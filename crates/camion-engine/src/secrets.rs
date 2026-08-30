@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use camion_providers::Secret;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -18,6 +18,56 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, id: &str) -> Result<Secret>;
     fn set(&self, id: &str, secret: &Secret) -> Result<()>;
     fn remove(&self, id: &str) -> Result<()>;
+}
+
+/// Where secrets live, which may not be open yet.
+///
+/// The encrypted file needs a passphrase, and at start-up there is nobody to ask: the window is
+/// not up, and demanding one before anything needs a secret would greet everyone who has no
+/// keyring with a password box they did not ask for. So the choice of store is made once —
+/// it is a property of the machine — and the opening of it waits until a connection actually
+/// wants a credential, which is a moment the engine can ask about.
+pub struct Vault {
+    state: Mutex<State>,
+}
+
+enum State {
+    Open(Arc<dyn SecretStore>),
+    Locked(PathBuf),
+}
+
+impl Vault {
+    pub fn open(store: Arc<dyn SecretStore>) -> Self {
+        Self { state: Mutex::new(State::Open(store)) }
+    }
+
+    /// An encrypted file that has not been opened yet.
+    pub fn locked(path: impl Into<PathBuf>) -> Self {
+        Self { state: Mutex::new(State::Locked(path.into())) }
+    }
+
+    /// The store, or `None` while a passphrase is still needed.
+    pub fn store(&self) -> Option<Arc<dyn SecretStore>> {
+        match &*self.state.lock().unwrap() {
+            State::Open(store) => Some(Arc::clone(store)),
+            State::Locked(_) => None,
+        }
+    }
+
+    /// Opens the file, or says the passphrase was wrong so it can be asked for again.
+    pub fn unlock(&self, passphrase: &str) -> Result<Arc<dyn SecretStore>> {
+        let mut state = self.state.lock().unwrap();
+
+        let path = match &*state {
+            State::Open(store) => return Ok(Arc::clone(store)),
+            State::Locked(path) => path.clone(),
+        };
+
+        let store: Arc<dyn SecretStore> = Arc::new(EncryptedFile::open(path, passphrase)?);
+        *state = State::Open(Arc::clone(&store));
+
+        Ok(store)
+    }
 }
 
 /// The desktop's own secret service — GNOME Keyring, KWallet, and anything else that speaks the

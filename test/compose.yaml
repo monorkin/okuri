@@ -2,8 +2,12 @@ name: camion-test
 
 # The destinations the conformance suite runs against.
 #
-#   docker compose -f test/compose.yaml up -d
+#   docker compose -f test/compose.yaml up -d --wait
 #   cargo test --workspace -- --ignored
+#
+# `--wait` matters: the bucket and container are made by one-shot services, and without it
+# `up` returns before they have finished — the suite then fails on a bucket that is seconds away
+# from existing.
 #
 # Every service is disposable and holds nothing worth keeping.
 

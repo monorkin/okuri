@@ -12,7 +12,7 @@ pub mod path;
 pub mod provider;
 pub mod stream;
 
-pub use capabilities::{Capabilities, Operation, Support};
+pub use capabilities::{Capabilities, Support};
 pub use entry::{Column, Entry, EntryKind, Permissions, Sort};
 pub use error::{Error, Result};
 pub use memory::MemoryProvider;

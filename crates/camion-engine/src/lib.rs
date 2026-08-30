@@ -20,7 +20,7 @@ pub use engine::{Command, Engine};
 pub use error::{Error, Result};
 pub use event::{Answer, Event, Outcome, Prompt, Question};
 pub use known_hosts::{KnownHosts, Verdict};
-pub use secrets::SecretStore;
+pub use secrets::{SecretStore, Vault};
 pub use session::SessionId;
 pub use transfer::{Transfer, TransferId};
 

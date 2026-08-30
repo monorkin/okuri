@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::config::Connection;
 use crate::event::{Answer, Event, Outcome, Prompt, Question};
 use crate::known_hosts::KnownHosts;
-use crate::secrets::SecretStore;
+use crate::secrets::{SecretStore, Vault};
 use crate::session::{Session, SessionId};
 use crate::transfer::{counting, Endpoint, Transfer, TransferId};
 use crate::trust::PromptingTrust;
@@ -51,7 +51,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(secrets: Arc<dyn SecretStore>, emit: Emitter) -> Self {
+    pub fn start(secrets: Arc<Vault>, emit: Emitter) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
 
         std::thread::Builder::new()
@@ -78,7 +78,7 @@ impl Engine {
 
 async fn serve(
     mut commands: mpsc::UnboundedReceiver<Command>,
-    secrets: Arc<dyn SecretStore>,
+    secrets: Arc<Vault>,
     emit: Emitter,
 ) {
     let trust = Arc::new(PromptingTrust::new(
@@ -105,7 +105,7 @@ async fn serve(
 
 struct Running {
     emit: Emitter,
-    secrets: Arc<dyn SecretStore>,
+    secrets: Arc<Vault>,
     trust: Arc<PromptingTrust>,
     sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
     /// What is in flight, and on which connection — the session is what tells us when a batch
@@ -214,10 +214,36 @@ impl Running {
         Ok(camion_providers::connect(&connection.destination, &secret, trust).await?)
     }
 
+    /// The store, opening it first if it is still locked.
+    ///
+    /// Asked for here rather than at start-up, because this is the first moment a passphrase is
+    /// worth anything to anybody: something wants a credential. A wrong one is asked again
+    /// rather than failing the connection, which is what anyone mistyping expects.
+    async fn secrets(&self) -> Result<Arc<dyn SecretStore>> {
+        loop {
+            if let Some(store) = self.secrets.store() {
+                return Ok(store);
+            }
+
+            let answer = self.ask(Question::Passphrase).await;
+
+            let Some(passphrase) = answer.text() else {
+                return Err(Error::Cancelled);
+            };
+
+            match self.secrets.unlock(passphrase) {
+                Ok(store) => return Ok(store),
+                Err(Error::WrongPassphrase) => self.report(Error::WrongPassphrase),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// The secret this destination needs, from the store if it is there and from the person at
     /// the keyboard if it is not.
     async fn secret_for(&self, connection: &Connection) -> Result<Secret> {
-        let stored = self.secrets.get(&connection.id)?;
+        let secrets = self.secrets().await?;
+        let stored = secrets.get(&connection.id)?;
         let shape = connection.destination.secret_shape();
 
         if shape == SecretShape::None || !stored.is_none() {
@@ -242,7 +268,7 @@ impl Running {
             _ => return Err(Error::Cancelled),
         };
 
-        self.secrets.set(&connection.id, &secret)?;
+        secrets.set(&connection.id, &secret)?;
 
         Ok(secret)
     }
@@ -255,7 +281,7 @@ impl Running {
         };
 
         let secret = Secret::Password(passphrase.to_owned());
-        self.secrets.set(&connection.id, &secret)?;
+        self.secrets().await?.set(&connection.id, &secret)?;
 
         Ok(secret)
     }
@@ -286,10 +312,17 @@ impl Running {
 
     async fn open(&self, id: SessionId, path: RemotePath) -> Result<()> {
         let session = self.session(id)?;
+        let navigation = session.navigating();
 
         self.emit(Event::Working { session: id, working: true });
         let listing = session.provider.list(&path).await;
         self.emit(Event::Working { session: id, working: false });
+
+        // Somewhere else was asked for while this was in flight, so this answer is about a
+        // folder nobody is waiting for any more. Showing it would move the window on its own.
+        if !session.is_current(navigation) {
+            return Ok(());
+        }
 
         match listing {
             Ok(entries) => {
@@ -389,6 +422,10 @@ impl Running {
                 .to_string_lossy()
                 .into_owned();
 
+            let Some(name) = self.arriving_as(&session, &into, name).await? else {
+                continue;
+            };
+
             let destination = into.join(&name)?;
             let mut transfer = Transfer::new(
                 Endpoint::Local(source.clone()),
@@ -407,6 +444,28 @@ impl Running {
         }
 
         Ok(())
+    }
+
+    /// What an uploaded file ends up called, once whatever is already there has been taken
+    /// into account.
+    ///
+    /// `None` means it is not to be uploaded at all. Overwriting without asking is how an
+    /// afternoon's work goes missing under a file of the same name from a downloads folder.
+    async fn arriving_as(
+        &self,
+        session: &Session,
+        into: &RemotePath,
+        name: String,
+    ) -> Result<Option<String>> {
+        if !session.provider.exists(&into.join(&name)?).await? {
+            return Ok(Some(name));
+        }
+
+        match self.ask(Question::Overwrite { name: name.clone() }).await {
+            Answer::Accept => Ok(Some(name)),
+            Answer::KeepBoth => Ok(Some(session.provider.unused_name(into, &name).await?)),
+            _ => Ok(None),
+        }
     }
 
     async fn download(

@@ -1,35 +1,3 @@
-use std::fmt;
-
-/// What a provider can be asked to do, named the way the UI names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Operation {
-    List,
-    Stat,
-    Read,
-    Write,
-    Delete,
-    CreateFolder,
-    Rename,
-    SetPermissions,
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::List => "listing",
-            Self::Stat => "inspecting",
-            Self::Read => "downloading",
-            Self::Write => "uploading",
-            Self::Delete => "deleting",
-            Self::CreateFolder => "creating folders",
-            Self::Rename => "renaming",
-            Self::SetPermissions => "changing permissions",
-        };
-
-        formatter.write_str(name)
-    }
-}
-
 /// How well a provider supports an operation.
 ///
 /// `Emulated` is the interesting one. Renaming on S3 means copying every object under a prefix
@@ -60,10 +28,7 @@ impl Support {
 pub struct Capabilities {
     pub rename: Support,
     pub create_folder: Support,
-    pub permissions: Support,
     pub empty_folders: Support,
-    pub resume_uploads: bool,
-    pub max_upload_size: Option<u64>,
     /// How many transfers this kind of destination will take at once.
     ///
     /// Stated rather than inferred from the other flags: eight parallel uploads is polite to an
@@ -78,10 +43,7 @@ impl Capabilities {
         Self {
             rename: Support::Native,
             create_folder: Support::Native,
-            permissions: Support::Native,
             empty_folders: Support::Native,
-            resume_uploads: true,
-            max_upload_size: None,
             transfer_slots: 4,
         }
     }
@@ -91,28 +53,11 @@ impl Capabilities {
         Self {
             rename: Support::Emulated,
             create_folder: Support::Emulated,
-            permissions: Support::Unsupported,
             empty_folders: Support::Emulated,
-            resume_uploads: false,
-            max_upload_size: None,
             transfer_slots: 8,
         }
     }
 
-    /// Every operation is named rather than caught by a fallback, so adding one to
-    /// [`Operation`] is a compile error here instead of a silent claim of full support.
-    pub fn supports(&self, operation: Operation) -> Support {
-        match operation {
-            Operation::Rename => self.rename,
-            Operation::CreateFolder => self.create_folder,
-            Operation::SetPermissions => self.permissions,
-            Operation::List
-            | Operation::Stat
-            | Operation::Read
-            | Operation::Write
-            | Operation::Delete => Support::Native,
-        }
-    }
 }
 
 impl Default for Capabilities {

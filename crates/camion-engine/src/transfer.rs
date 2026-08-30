@@ -74,6 +74,19 @@ pub struct Transfer {
 }
 
 impl Transfer {
+    /// The connection this transfer runs on.
+    ///
+    /// Taken from whichever end is remote, so a queue shown beside several open connections can
+    /// say which one a row belongs to. A transfer between two remotes answers with the one it
+    /// is being written to, which is the one whose folder changes.
+    pub fn session(&self) -> Option<SessionId> {
+        match (&self.to, &self.from) {
+            (Endpoint::Remote { session, .. }, _) => Some(*session),
+            (_, Endpoint::Remote { session, .. }) => Some(*session),
+            _ => None,
+        }
+    }
+
     pub fn new(from: Endpoint, to: Endpoint) -> Self {
         let direction = match (&from, &to) {
             (Endpoint::Local(_), Endpoint::Remote { .. }) => Direction::Upload,

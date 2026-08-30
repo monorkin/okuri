@@ -99,6 +99,14 @@ Dialog {
                 onClicked: App.answer(false, "", "")
             }
 
+            /// Only some questions have a third answer — replacing a file can also mean
+            /// keeping both — so this is here when there is one and gone when there is not.
+            FlatButton {
+                text: App.questionAlternative
+                visible: App.questionAlternative !== ""
+                onClicked: App.answerAlternative()
+            }
+
             FlatButton {
                 text: App.questionAccept
                 highlighted: true

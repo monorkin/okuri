@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Support,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
 };
 use futures::StreamExt;
 use suppaftp::list::File as Listed;
@@ -98,10 +98,10 @@ impl Provider for FtpProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            // The protocol has no portable way to change a mode, and resuming needs REST,
-            // which not every server offers.
-            permissions: Support::Unsupported,
-            resume_uploads: false,
+            // One command channel, one transfer at a time. Handing this connection four
+            // uploads at once only queues four whole files behind the same lock — and since a
+            // download is read into memory before it is handed on, four of them in RAM.
+            transfer_slots: 1,
             ..Capabilities::filesystem()
         }
     }

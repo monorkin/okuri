@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Support,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
 };
 use futures::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -140,10 +140,7 @@ impl Provider for WebDavProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            permissions: Support::Unsupported,
-            ..Capabilities::filesystem()
-        }
+        Capabilities::filesystem()
     }
 
     async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>> {

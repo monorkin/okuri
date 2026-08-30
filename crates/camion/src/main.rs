@@ -10,6 +10,7 @@ mod icons;
 mod kinds;
 mod palette;
 mod qt;
+mod screen;
 mod store;
 mod theme;
 mod transfers;

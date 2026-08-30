@@ -130,7 +130,8 @@ impl cxx_qt::Initialize for qobject::Transfers {
                 crate::qt::queue(&thread, move |model| model.finish(id, outcome));
             }
             _ => {}
-        });
+        })
+        .forever();
     }
 }
 

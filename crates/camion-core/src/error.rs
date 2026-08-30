@@ -1,6 +1,5 @@
 use std::fmt;
 
-use crate::capabilities::Operation;
 use crate::path::RemotePath;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -25,8 +24,6 @@ pub enum Error {
     #[error("not permitted: {path}")]
     PermissionDenied { path: RemotePath },
 
-    #[error("{0} is not supported by this connection")]
-    Unsupported(Operation),
 
     #[error("{input:?} is not a valid path: it {reason}")]
     InvalidPath { input: String, reason: &'static str },
@@ -62,11 +59,5 @@ impl Error {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self::Provider { message: message.to_string(), source: Some(Box::new(source)) }
-    }
-
-    /// Whether retrying the same operation could plausibly succeed. The transfer queue uses
-    /// this to decide between retrying an item and surfacing it as failed.
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Provider { .. })
     }
 }

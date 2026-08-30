@@ -80,7 +80,8 @@ pub enum Question {
     /// need one, so an unencrypted key never prompts.
     KeyPassphrase { path: String },
 
-    /// A file of that name is already there.
+    /// A file of that name is already there. Answered by replacing it, keeping both, or
+    /// letting the upload go no further.
     Overwrite { name: String },
 }
 
@@ -88,6 +89,9 @@ pub enum Question {
 pub enum Answer {
     Accept,
     Decline,
+    /// The third choice, for the questions that have one: [`Question::Overwrite`] offers
+    /// keeping both files alongside replacing and cancelling.
+    KeepBoth,
     Text(String),
     Pair { id: String, secret: String },
 }

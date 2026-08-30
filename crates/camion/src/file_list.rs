@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use camion_core::{Column, Entry, RemotePath, Sort};
 use camion_engine::transfer::Endpoint;
-use camion_engine::{Event, TransferId};
+use camion_engine::{Event, SessionId, TransferId};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
@@ -119,6 +119,13 @@ pub struct FileListRust {
     working: bool,
     count: i32,
 
+    /// Which connection this list is showing, once one is open.
+    ///
+    /// Every event says which session it came from, and a list that ignored that would redraw
+    /// itself from any connection's news — which is what a second list beside this one would
+    /// make happen on its first listing.
+    session: Option<SessionId>,
+
     /// What the server last said is here.
     entries: Vec<Entry>,
 
@@ -201,6 +208,7 @@ impl Default for FileListRust {
             path: QString::from("/"),
             working: false,
             count: 0,
+            session: None,
             entries: Vec::new(),
             arriving: Vec::new(),
             rows: Vec::new(),
@@ -216,19 +224,32 @@ impl cxx_qt::Initialize for qobject::FileList {
         let thread = self.qt_thread();
 
         crate::bus::listen(move |event| match event.as_ref() {
-            Event::Listing { path, entries, .. } => {
-                let path = path.clone();
-                let entries = entries.clone();
+            // Which connection this list is showing. Every event carries the session it came
+            // from, and a list beside this one has to ignore the other's news rather than
+            // redraw itself with it — so the filtering happens in the model, where the answer
+            // to "which connection am I" can actually be read.
+            Event::Connected { session, .. } => {
+                let session = *session;
 
-                crate::qt::queue(&thread, move |model| model.replace(path, entries));
+                crate::qt::queue(&thread, move |model| model.follow(session));
             }
-            Event::Working { working, .. } => {
-                let working = *working;
 
-                crate::qt::queue(&thread, move |mut model| model.as_mut().set_working(working));
+            Event::Listing { session, path, entries } => {
+                let (session, path, entries) = (*session, path.clone(), entries.clone());
+
+                crate::qt::queue(&thread, move |model| model.replace(session, path, entries));
             }
-            Event::Disconnected { .. } => {
-                crate::qt::queue(&thread, |model| model.replace(RemotePath::root(), Vec::new()));
+
+            Event::Working { session, working } => {
+                let (session, working) = (*session, *working);
+
+                crate::qt::queue(&thread, move |model| model.set_busy(session, working));
+            }
+
+            Event::Disconnected { session } => {
+                let session = *session;
+
+                crate::qt::queue(&thread, move |model| model.close(session));
             }
 
             // A file that has been dropped belongs on screen immediately, filling as it goes.
@@ -241,6 +262,10 @@ impl cxx_qt::Initialize for qobject::FileList {
                     return;
                 };
 
+                let Some(session) = transfer.session() else {
+                    return;
+                };
+
                 let arriving = Arriving {
                     transfer: transfer.id,
                     folder,
@@ -250,9 +275,11 @@ impl cxx_qt::Initialize for qobject::FileList {
                     landed: false,
                 };
 
-                crate::qt::queue(&thread, move |model| model.expect(arriving));
+                crate::qt::queue(&thread, move |model| model.expect(session, arriving));
             }
 
+            // Progress and completion carry no session, and need none: they can only ever name
+            // a transfer this list already agreed to show.
             Event::TransferProgress { transfer, transferred } => {
                 let (id, transferred) = (*transfer, *transferred);
 
@@ -266,7 +293,8 @@ impl cxx_qt::Initialize for qobject::FileList {
             }
 
             _ => {}
-        });
+        })
+        .forever();
 
         // Icons come from the desktop's theme, so switching themes has to change them here as
         // well. Without this the window keeps drawing the icons of a theme that is gone.
@@ -379,7 +407,34 @@ impl qobject::FileList {
         self.rebuild();
     }
 
-    fn replace(mut self: Pin<&mut Self>, path: RemotePath, entries: Vec<Entry>) {
+    /// Starts showing a connection.
+    fn follow(mut self: Pin<&mut Self>, session: SessionId) {
+        self.as_mut().rust_mut().session = Some(session);
+    }
+
+    /// Whether news from `session` is news about what this list is showing.
+    fn showing(&self, session: SessionId) -> bool {
+        self.rust().session == Some(session)
+    }
+
+    fn close(mut self: Pin<&mut Self>, session: SessionId) {
+        if self.showing(session) {
+            self.as_mut().rust_mut().session = None;
+            self.replace(session, RemotePath::root(), Vec::new());
+        }
+    }
+
+    fn set_busy(mut self: Pin<&mut Self>, session: SessionId, working: bool) {
+        if self.showing(session) {
+            self.as_mut().set_working(working);
+        }
+    }
+
+    fn replace(mut self: Pin<&mut Self>, session: SessionId, path: RemotePath, entries: Vec<Entry>) {
+        if !self.showing(session) {
+            return;
+        }
+
         // A fresh listing of a folder is the truth about it, so anything that was standing in
         // for a file there has done its job.
         self.as_mut()
@@ -393,7 +448,11 @@ impl qobject::FileList {
     }
 
     /// Notes a file that is on its way here, so it shows up the moment it is dropped.
-    fn expect(mut self: Pin<&mut Self>, arriving: Arriving) {
+    fn expect(mut self: Pin<&mut Self>, session: SessionId, arriving: Arriving) {
+        if !self.showing(session) {
+            return;
+        }
+
         self.as_mut().rust_mut().arriving.push(arriving);
         self.rebuild();
     }
