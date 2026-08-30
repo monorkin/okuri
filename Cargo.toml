@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/camion-core",
+    "crates/camion-providers",
+    "crates/camion-engine",
+    "crates/camion",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/monorkin/camion"
+
+[workspace.dependencies]
+camion-core = { path = "crates/camion-core" }
+camion-engine = { path = "crates/camion-engine" }
+camion-providers = { path = "crates/camion-providers" }
+
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+thiserror = "2"
+time = "0.3"
+tokio = "1"

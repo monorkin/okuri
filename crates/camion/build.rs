@@ -1,0 +1,45 @@
+use cxx_qt_build::{CxxQtBuilder, QmlModule};
+
+fn main() {
+    CxxQtBuilder::new_qml_module(
+        QmlModule::new("io.camion")
+            .version(1, 0)
+            .qml_files([
+                "qml/Ask.qml",
+                "qml/Breadcrumb.qml",
+                "qml/Browser.qml",
+                "qml/ConnectionEditor.qml",
+                "qml/ConnectionPicker.qml",
+                "qml/CheckItem.qml",
+                "qml/ColumnsDialog.qml",
+                "qml/Confirm.qml",
+                "qml/Field.qml",
+                "qml/FileMenu.qml",
+                "qml/FlatButton.qml",
+                "qml/Grid.qml",
+                "qml/Header.qml",
+                "qml/Heading.qml",
+                "qml/Main.qml",
+                "qml/NameDialog.qml",
+                "qml/Notice.qml",
+                "qml/RadioItem.qml",
+                "qml/Rows.qml",
+                "qml/Selection.qml",
+                "qml/SpringLoaded.qml",
+                "qml/Toggle.qml",
+                "qml/Toolbar.qml",
+                "qml/TransferQueue.qml",
+                "qml/ViewMenu.qml",
+            ]),
+    )
+    .files([
+        "src/app.rs",
+        "src/connections.rs",
+        "src/display.rs",
+        "src/file_list.rs",
+        "src/qt.rs",
+        "src/theme.rs",
+        "src/transfers.rs",
+    ])
+    .build();
+}

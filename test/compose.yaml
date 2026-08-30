@@ -1,0 +1,50 @@
+name: camion-test
+
+# The destinations the conformance suite runs against.
+#
+#   docker compose -f test/compose.yaml up -d
+#   cargo test --workspace -- --ignored
+#
+# Every service is disposable and holds nothing worth keeping.
+
+services:
+  sftp:
+    image: atmoz/sftp:alpine
+    ports:
+      - "2222:22"
+    command: camion:camion:::scratch
+
+  ftp:
+    image: delfer/alpine-ftp-server
+    ports:
+      - "2121:21"
+      - "21000-21010:21000-21010"
+    environment:
+      USERS: "camion|camion|/home/camion|1000"
+      ADDRESS: localhost
+      MIN_PORT: 21000
+      MAX_PORT: 21010
+
+  s3:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+    environment:
+      MINIO_ROOT_USER: camion
+      MINIO_ROOT_PASSWORD: camion-secret
+    command: server /data
+
+  webdav:
+    image: bytemark/webdav
+    ports:
+      - "8080:80"
+    environment:
+      AUTH_TYPE: Basic
+      USERNAME: camion
+      PASSWORD: camion
+
+  azure:
+    image: mcr.microsoft.com/azure-storage/azurite
+    ports:
+      - "10000:10000"
+    command: azurite-blob --blobHost 0.0.0.0

@@ -1,0 +1,566 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use camion_core::{
+    ByteRange, ByteStream, Capabilities, Entry, Error, Permissions, Provider, RemotePath, Result,
+};
+use russh::client;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+use crate::destination::{Sftp, SshCredential};
+use crate::secret::Secret;
+use crate::ssh_config::SshConfig;
+use crate::trust::{HostKey, HostTrust};
+
+/// A remote filesystem over SSH.
+///
+/// The closest thing to a local disk any of the destinations offer: real folders, real renames,
+/// real permissions. Everything in [`Capabilities`] is native.
+pub struct SftpProvider {
+    label: String,
+    home: String,
+    sftp: SftpSession,
+    connection: client::Handle<HostKeyCheck>,
+}
+
+impl SftpProvider {
+    pub async fn connect(
+        config: &Sftp,
+        secret: &Secret,
+        trust: Arc<dyn HostTrust>,
+    ) -> Result<Self> {
+        // What `ssh` would do with this name, which is often not what the name says: an alias
+        // for somewhere else, on another port, with a key or an agent of its own.
+        let ssh = SshConfig::for_host(&config.host);
+
+        let host = ssh.hostname.clone().unwrap_or_else(|| config.host.clone());
+        let port = match config.port {
+            22 => ssh.port.unwrap_or(22),
+            chosen => chosen,
+        };
+        let username = match config.username.is_empty() {
+            true => ssh.user.clone().unwrap_or_default(),
+            false => config.username.clone(),
+        };
+
+        let handler = HostKeyCheck {
+            trust,
+            host: host.clone(),
+            port,
+        };
+
+        let mut connection = client::connect(
+            Arc::new(client::Config::default()),
+            (host.as_str(), port),
+            handler,
+        )
+        .await
+        .map_err(|error| Error::caused_by(format!("could not reach {host}"), error))?;
+
+        authenticate(&mut connection, config, &username, &ssh, secret).await?;
+
+        let channel = connection
+            .channel_open_session()
+            .await
+            .map_err(|error| Error::caused_by("could not open an SSH channel", error))?;
+
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|error| Error::caused_by("the server refused the SFTP subsystem", error))?;
+
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|error| Error::caused_by("could not start an SFTP session", error))?;
+
+        let home = if config.home.is_empty() {
+            sftp.canonicalize(".")
+                .await
+                .map_err(|error| Error::caused_by("could not find the home directory", error))?
+        } else {
+            config.home.clone()
+        };
+
+        Ok(Self {
+            label: format!("{}@{}", config.username, config.host),
+            home: home.trim_end_matches('/').to_owned(),
+            sftp,
+            connection,
+        })
+    }
+
+    /// Turns a path the UI is holding into one the server understands, by hanging it off the
+    /// directory this connection calls its root.
+    fn absolute(&self, path: &RemotePath) -> String {
+        if path.is_root() {
+            match self.home.is_empty() {
+                true => "/".to_owned(),
+                false => self.home.clone(),
+            }
+        } else {
+            format!("{}/{}", self.home, path.to_key())
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for SftpProvider {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::filesystem()
+    }
+
+    async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>> {
+        let listing = self
+            .sftp
+            .read_dir(self.absolute(path))
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        Ok(listing
+            .filter(|entry| entry.file_name() != "." && entry.file_name() != "..")
+            .map(|entry| describe(entry.file_name(), &entry.metadata()))
+            .collect())
+    }
+
+    async fn stat(&self, path: &RemotePath) -> Result<Entry> {
+        let metadata = self
+            .sftp
+            .metadata(self.absolute(path))
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        Ok(describe(path.name().unwrap_or("/").to_owned(), &metadata))
+    }
+
+    async fn read(&self, path: &RemotePath, range: Option<ByteRange>) -> Result<ByteStream> {
+        let mut file = self
+            .sftp
+            .open(self.absolute(path))
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        let size = file
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.size)
+            .unwrap_or_default();
+
+        let (offset, length) = match range {
+            None => (0, size),
+            Some(range) => {
+                let offset = range.offset.min(size);
+                (offset, range.length.unwrap_or(size - offset).min(size - offset))
+            }
+        };
+
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| Error::caused_by("could not seek", error))?;
+        }
+
+        let chunks = futures::StreamExt::map(
+            tokio_util::io::ReaderStream::new(file.take(length)),
+            |chunk| chunk.map_err(|error| Error::caused_by("the download was interrupted", error)),
+        );
+
+        Ok(ByteStream::new(chunks, Some(length)))
+    }
+
+    async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
+        let mut file = self
+            .sftp
+            .open_with_flags(
+                self.absolute(path),
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        let mut reader = tokio_util::io::StreamReader::new(
+            futures::StreamExt::map(body, |chunk| {
+                chunk.map_err(|error| std::io::Error::other(error.to_string()))
+            }),
+        );
+
+        tokio::io::copy(&mut reader, &mut file)
+            .await
+            .map_err(|error| Error::caused_by("the upload was interrupted", error))?;
+
+        file.shutdown()
+            .await
+            .map_err(|error| Error::caused_by("the upload could not be finished", error))?;
+
+        Ok(())
+    }
+
+    async fn delete(&self, path: &RemotePath) -> Result<()> {
+        let entry = self.stat(path).await?;
+        let absolute = self.absolute(path);
+
+        if entry.kind.is_folder() {
+            self.sftp.remove_dir(absolute).await
+        } else {
+            self.sftp.remove_file(absolute).await
+        }
+        .map_err(|error| translate(error, path))
+    }
+
+    async fn create_folder(&self, path: &RemotePath) -> Result<()> {
+        self.sftp
+            .create_dir(self.absolute(path))
+            .await
+            .map_err(|error| translate(error, path))
+    }
+
+    async fn rename(&self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+        self.sftp
+            .rename(self.absolute(from), self.absolute(to))
+            .await
+            .map_err(|error| translate(error, from))
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        let _ = self.sftp.close().await;
+        let _ = self
+            .connection
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+
+        Ok(())
+    }
+}
+
+async fn authenticate(
+    connection: &mut client::Handle<HostKeyCheck>,
+    config: &Sftp,
+    username: &str,
+    ssh: &SshConfig,
+    secret: &Secret,
+) -> Result<()> {
+    let accepted = match &config.credential {
+        SshCredential::Password => {
+            let password = secret
+                .password()
+                .ok_or_else(|| Error::Authentication("no password was provided".to_owned()))?;
+
+            connection
+                .authenticate_password(username, password)
+                .await
+                .map_err(|error| Error::caused_by("the password was refused", error))?
+                .success()
+        }
+        SshCredential::Key { path } => {
+            let key = russh::keys::load_secret_key(expand_home(path), secret.password())
+                .map_err(|error| match error {
+                    // An encrypted key is not a broken one. Saying which it is lets the
+                    // passphrase be asked for rather than the connection simply failing.
+                    russh::keys::Error::KeyIsEncrypted => {
+                        Error::NeedsPassphrase { path: path.clone() }
+                    }
+                    error => Error::caused_by(format!("could not read {path}"), error),
+                })?;
+
+            connection
+                .authenticate_publickey(
+                    username,
+                    russh::keys::PrivateKeyWithHashAlg::new(
+                        Arc::new(key),
+                        Some(russh::keys::HashAlg::Sha256),
+                    ),
+                )
+                .await
+                .map_err(|error| Error::caused_by("the key was refused", error))?
+                .success()
+        }
+        SshCredential::Agent => {
+            let attempt = authenticate_like_ssh(connection, username, ssh).await?;
+
+            if !attempt.accepted {
+                return Err(Error::Authentication(format!(
+                    "{username} was not accepted by {}: {}",
+                    config.host,
+                    attempt.describe()
+                )));
+            }
+
+            true
+        }
+    };
+
+    if accepted {
+        Ok(())
+    } else {
+        Err(Error::Authentication(format!(
+            "{} was not accepted by {}",
+            config.username, config.host
+        )))
+    }
+}
+
+/// Signs in the way `ssh` would: the agent first, then the usual key files.
+///
+/// Anyone who can reach a server from a terminal expects to reach it from here, and `ssh` does
+/// not stop at the agent. Whatever is tried is written down, so that failing says what was
+/// attempted rather than guessing at a reason.
+async fn authenticate_like_ssh(
+    connection: &mut client::Handle<HostKeyCheck>,
+    username: &str,
+    ssh: &SshConfig,
+) -> Result<Attempt> {
+    let mut attempt = Attempt::default();
+
+    match agent(ssh).await {
+        Ok(Some(mut agent)) => {
+            let identities = agent.request_identities().await.unwrap_or_default();
+
+            if identities.is_empty() {
+                attempt.tried.push("the SSH agent, which is holding no keys".to_owned());
+            }
+
+            for identity in identities {
+                let (key, name) = match identity {
+                    russh::keys::agent::AgentIdentity::PublicKey { key, comment } => (key, comment),
+                    russh::keys::agent::AgentIdentity::Certificate { certificate, comment } => (
+                        russh::keys::PublicKey::new(certificate.public_key().clone(), ""),
+                        comment,
+                    ),
+                };
+
+                let signed = connection
+                    .authenticate_publickey_with(
+                        username,
+                        key,
+                        Some(russh::keys::HashAlg::Sha256),
+                        &mut agent,
+                    )
+                    .await;
+
+                match signed {
+                    Ok(result) if result.success() => {
+                        attempt.accepted = true;
+
+                        return Ok(attempt);
+                    }
+                    Ok(_) => attempt.tried.push(format!("{name} from the agent")),
+                    Err(error) => attempt
+                        .tried
+                        .push(format!("{name} from the agent ({error})")),
+                }
+            }
+        }
+
+        Ok(None) => attempt
+            .tried
+            .push("no SSH agent (SSH_AUTH_SOCK is not set, and ~/.ssh/config names none)".to_owned()),
+
+        Err(error) => attempt.tried.push(format!("the SSH agent ({error})")),
+    }
+
+    for path in identities(ssh) {
+        let shown = path.display().to_string();
+
+        // A key that needs a passphrase cannot be used this way: there is nowhere to ask for
+        // one, so it says which key it was and how to use it.
+        match russh::keys::load_secret_key(&path, None) {
+            Ok(key) => {
+                let signed = connection
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(
+                            std::sync::Arc::new(key),
+                            Some(russh::keys::HashAlg::Sha256),
+                        ),
+                    )
+                    .await;
+
+                match signed {
+                    Ok(result) if result.success() => {
+                        attempt.accepted = true;
+
+                        return Ok(attempt);
+                    }
+                    Ok(_) => attempt.tried.push(shown),
+                    Err(error) => attempt.tried.push(format!("{shown} ({error})")),
+                }
+            }
+            Err(error) => attempt
+                .tried
+                .push(format!("{shown} ({}) — choose \"Key file\" to be asked for its passphrase", short(&error))),
+        }
+    }
+
+    Ok(attempt)
+}
+
+/// What signing in tried, so that failing can say so.
+#[derive(Default)]
+struct Attempt {
+    accepted: bool,
+    tried: Vec<String>,
+}
+
+impl Attempt {
+    fn describe(&self) -> String {
+        match self.tried.is_empty() {
+            true => "nothing to sign in with was found".to_owned(),
+            false => format!("tried {}", self.tried.join(", ")),
+        }
+    }
+}
+
+/// The agent, if there is one to reach.
+///
+/// Not finding `SSH_AUTH_SOCK` and failing to reach the socket it names are different problems
+/// with different answers, so they are told apart here rather than reported as the same thing.
+async fn agent(
+    ssh: &SshConfig,
+) -> std::result::Result<Option<russh::keys::agent::client::AgentClient<tokio::net::UnixStream>>, String>
+{
+    // `IdentityAgent` wins over the session's own, which is the whole point of writing it down:
+    // a password manager runs an agent and says so there.
+    let socket = match &ssh.identity_agent {
+        Some(named) => named.clone().into_os_string(),
+        None => match std::env::var_os("SSH_AUTH_SOCK") {
+            Some(socket) => socket,
+            None => return Ok(None),
+        },
+    };
+
+    russh::keys::agent::client::AgentClient::connect_uds(&socket)
+        .await
+        .map(Some)
+        .map_err(|error| format!("{} could not be reached: {error}", socket.to_string_lossy()))
+}
+
+/// The keys to offer: the ones the config names, and otherwise the ones `ssh` falls back to.
+fn identities(ssh: &SshConfig) -> Vec<std::path::PathBuf> {
+    if !ssh.identity_files.is_empty() {
+        return ssh
+            .identity_files
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned()
+            .collect();
+    }
+
+    default_keys()
+}
+
+/// The key files `ssh` reads when nothing else says otherwise, in the order it reads them.
+fn default_keys() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+
+    let ssh = std::path::Path::new(&home).join(".ssh");
+
+    ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk", "id_rsa"]
+        .iter()
+        .map(|name| ssh.join(name))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn short(error: &impl std::fmt::Display) -> String {
+    error.to_string().lines().next().unwrap_or_default().to_owned()
+}
+
+struct HostKeyCheck {
+    trust: Arc<dyn HostTrust>,
+    host: String,
+    port: u16,
+}
+
+impl client::Handler for HostKeyCheck {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        offered: &russh::keys::PublicKeyOrCertificate,
+    ) -> std::result::Result<bool, Self::Error> {
+        let key = match offered {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+            russh::keys::PublicKeyOrCertificate::Certificate(certificate) => {
+                russh::keys::PublicKey::new(certificate.public_key().clone(), "")
+            }
+        };
+
+        let host_key = HostKey {
+            host: self.host.clone(),
+            port: self.port,
+            algorithm: key.algorithm().to_string(),
+            fingerprint: key.fingerprint(Default::default()).to_string(),
+            public_key: key
+                .to_openssh()
+                .unwrap_or_default()
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+
+        Ok(self.trust.verify(&host_key).await.is_trusted())
+    }
+}
+
+/// `known_hosts` writes a non-standard port as `[host]:port`, and Camion has to match that
+/// exactly or `ssh` and Camion will disagree about what has been trusted.
+pub fn known_hosts_host(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_owned(),
+        },
+        None => path.to_owned(),
+    }
+}
+
+fn describe(name: String, metadata: &russh_sftp::protocol::FileAttributes) -> Entry {
+    let mut entry = if metadata.is_dir() {
+        Entry::folder(name)
+    } else {
+        Entry::file(name, metadata.size.unwrap_or_default())
+    };
+
+    entry.modified = metadata
+        .mtime
+        .and_then(|mtime| time::OffsetDateTime::from_unix_timestamp(i64::from(mtime)).ok());
+    entry.permissions = metadata.permissions.map(Permissions);
+
+    entry
+}
+
+/// Turns an SFTP status into the domain's own vocabulary, so the UI can tell a missing file
+/// from a refused one without reading English.
+fn translate(error: russh_sftp::client::error::Error, path: &RemotePath) -> Error {
+    use russh_sftp::protocol::StatusCode;
+
+    match error {
+        russh_sftp::client::error::Error::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => Error::NotFound { path: path.clone() },
+            StatusCode::PermissionDenied => Error::PermissionDenied { path: path.clone() },
+            _ => Error::provider(status.error_message),
+        },
+        error => Error::caused_by(format!("{path} could not be reached"), error),
+    }
+}
