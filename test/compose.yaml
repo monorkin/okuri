@@ -34,6 +34,17 @@ services:
       MINIO_ROOT_PASSWORD: camion-secret
     command: server /data
 
+  # MinIO starts empty, and a bucket that does not exist is not something the suite is meant to
+  # be testing. Runs once and exits.
+  s3-bucket:
+    image: minio/mc
+    depends_on:
+      - s3
+    entrypoint:
+      - sh
+      - -c
+      - "until mc alias set camion http://s3:9000 camion camion-secret; do sleep 1; done; mc mb --ignore-existing camion/camion-test"
+
   webdav:
     image: bytemark/webdav
     ports:
@@ -48,3 +59,15 @@ services:
     ports:
       - "10000:10000"
     command: azurite-blob --blobHost 0.0.0.0
+
+  # The same for Azurite's container.
+  azure-container:
+    image: mcr.microsoft.com/azure-cli
+    depends_on:
+      - azure
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azure:10000/devstoreaccount1;"
+    entrypoint:
+      - sh
+      - -c
+      - "until az storage container create --name camion-test; do sleep 1; done"

@@ -104,7 +104,9 @@ pub trait ProviderExt: Provider {
         let stem = candidate.stem().unwrap_or(name).to_owned();
         let extension = candidate.extension().map(str::to_owned);
 
-        for suffix in 2.. {
+        let mut suffix = 2;
+
+        loop {
             let name = match &extension {
                 Some(extension) => format!("{stem} ({suffix}).{extension}"),
                 None => format!("{stem} ({suffix})"),
@@ -113,9 +115,9 @@ pub trait ProviderExt: Provider {
             if !self.exists(&folder.join(&name)?).await? {
                 return Ok(name);
             }
-        }
 
-        unreachable!()
+            suffix += 1;
+        }
     }
 }
 

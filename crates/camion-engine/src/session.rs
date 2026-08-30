@@ -30,7 +30,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(connection: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
-        let concurrency = concurrency_for(provider.as_ref());
+        let concurrency = provider.capabilities().transfer_slots;
 
         Self {
             id: SessionId::next(),
@@ -56,15 +56,5 @@ impl Session {
     /// starve a fast one.
     pub fn transfer_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.transfers)
-    }
-}
-
-/// Object stores are happiest with many small requests in flight; a single SSH connection
-/// multiplexing four transfers is already near the useful limit.
-fn concurrency_for(provider: &dyn Provider) -> usize {
-    if provider.capabilities().permissions.is_available() {
-        4
-    } else {
-        8
     }
 }

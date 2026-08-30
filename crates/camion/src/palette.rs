@@ -222,15 +222,18 @@ fn dark_from_gtk_settings(settings: &str) -> Option<bool> {
     })
 }
 
-/// Picks whichever of the two candidates stands out against `background`. A themed accent can
-/// be anything from navy to lemon, so the label on top of it cannot be a fixed colour.
-fn readable_on(background: Color, dark_candidate: Color, light_candidate: Color) -> Color {
+/// Whichever of the two candidates stands out more against `background`.
+///
+/// A themed accent can be anything from navy to lemon, so the label written on top of it cannot
+/// be a fixed colour. Neither candidate is the default: the one with more contrast wins, and
+/// `preferred` only settles a tie.
+fn readable_on(background: Color, preferred: Color, alternative: Color) -> Color {
     let contrast = |candidate: Color| (candidate.luminance() - background.luminance()).abs();
 
-    if contrast(dark_candidate) >= contrast(light_candidate) {
-        dark_candidate
+    if contrast(preferred) >= contrast(alternative) {
+        preferred
     } else {
-        light_candidate
+        alternative
     }
 }
 

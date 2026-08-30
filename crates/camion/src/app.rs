@@ -218,7 +218,7 @@ impl cxx_qt::Initialize for qobject::App {
         crate::bus::listen(move |event| {
             let event = Arc::clone(event);
 
-            let _ = thread.queue(move |app| app.receive(event));
+            crate::qt::queue(&thread, move |app| app.receive(event));
         });
 
         // `camion production-web` opens that connection straight away, which is what you want
@@ -278,23 +278,19 @@ impl qobject::App {
     pub fn create_folder(&self, name: QString) {
         let name = name.to_string();
 
-        self.command(move |session| Command::CreateFolder { session, name: name.clone() });
+        self.command(move |session| Command::CreateFolder { session, name });
     }
 
     pub fn rename(&self, from: QString, to: QString) {
         let (from, to) = (from.to_string(), to.to_string());
 
-        self.command(move |session| Command::Rename {
-            session,
-            from: from.clone(),
-            to: to.clone(),
-        });
+        self.command(move |session| Command::Rename { session, from, to });
     }
 
     pub fn remove(&self, names: QStringList) {
         let names = strings(&names);
 
-        self.command(move |session| Command::Delete { session, names: names.clone() });
+        self.command(move |session| Command::Delete { session, names });
     }
 
     pub fn drop_urls(&self, urls: QStringList) {
@@ -309,11 +305,7 @@ impl qobject::App {
 
         let into = self.rust().folder.clone();
 
-        self.command(move |session| Command::Upload {
-            session,
-            into: into.clone(),
-            sources: sources.clone(),
-        });
+        self.command(move |session| Command::Upload { session, into, sources });
     }
 
     pub fn download(&self, names: QStringList, folder: QString) {
@@ -322,11 +314,7 @@ impl qobject::App {
             return;
         };
 
-        self.command(move |session| Command::Download {
-            session,
-            names: names.clone(),
-            into: into.clone(),
-        });
+        self.command(move |session| Command::Download { session, names, into });
     }
 
     pub fn begin_move(mut self: Pin<&mut Self>, names: QStringList) {
@@ -344,12 +332,17 @@ impl qobject::App {
         self.as_mut().set_moving(names);
     }
 
+    /// Puts what is being dragged into `folder`.
+    ///
+    /// A drop is offered to more than one target, and a target that cannot say where it is has
+    /// to leave what is being carried alone — the next one to see the same drop is the one that
+    /// meant something. So nothing is cleared until this drop is actually being acted on.
     pub fn move_into(mut self: Pin<&mut Self>, folder: QString) {
         let names = strings(&self.moving().clone());
-        let (Ok(into), Ok(from)) = (
-            RemotePath::parse(&folder.to_string()),
-            RemotePath::parse(&self.moving_from().to_string()),
-        ) else {
+        let source = self.moving_from().to_string();
+        let target = folder.to_string();
+
+        let (Ok(into), Ok(from)) = (RemotePath::parse(&target), RemotePath::parse(&source)) else {
             return;
         };
 
@@ -359,12 +352,7 @@ impl qobject::App {
             return;
         }
 
-        self.command(move |session| Command::Move {
-            session,
-            from: from.clone(),
-            names: names.clone(),
-            into: into.clone(),
-        });
+        self.command(move |session| Command::Move { session, from, names, into });
     }
 
     pub fn end_move(mut self: Pin<&mut Self>) {
@@ -388,10 +376,12 @@ impl qobject::App {
 
         Some(urls.into_iter().collect())
     }
+
     pub fn cancel_transfer(&self, id: i64) {
-        self.rust().engine.send(Command::CancelTransfer(
-            camion_engine::TransferId(id.max(0) as u64),
-        ));
+        // A row with no transfer under it answers `-1`, which is not a transfer to cancel.
+        if let Ok(id) = u64::try_from(id) {
+            self.rust().engine.send(Command::CancelTransfer(camion_engine::TransferId(id)));
+        }
     }
 
     pub fn answer(mut self: Pin<&mut Self>, accepted: bool, first: QString, second: QString) {
@@ -431,12 +421,12 @@ impl qobject::App {
     }
 
     fn go_to(self: Pin<&mut Self>, path: RemotePath) {
-        self.command(move |session| Command::Open { session, path: path.clone() });
+        self.command(move |session| Command::Open { session, path });
     }
 
     /// Sends a command for whichever connection is open. With none open there is nothing the
     /// interface could have asked for, so there is nothing to report either.
-    fn command(&self, build: impl Fn(SessionId) -> Command) {
+    fn command(&self, build: impl FnOnce(SessionId) -> Command) {
         if let Some(session) = self.rust().session {
             self.rust().engine.send(build(session));
         }

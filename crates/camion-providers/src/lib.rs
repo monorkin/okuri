@@ -6,6 +6,8 @@
 
 pub mod azure;
 pub mod destination;
+mod keys;
+mod parts;
 pub mod ftp;
 pub mod s3;
 pub mod secret;

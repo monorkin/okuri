@@ -1,4 +1,28 @@
+use std::sync::OnceLock;
+
 use time::OffsetDateTime;
+
+/// The clock this machine keeps, captured before anything else starts.
+///
+/// `time` refuses to read the local offset once a process has more than one thread, because the
+/// answer it gives could already be stale — so it is asked once, first thing in `main`, and
+/// remembered. Servers report modification times in UTC, and showing those unconverted puts
+/// every file an hour or several out from what the person's own file manager says.
+static LOCAL: OnceLock<time::UtcOffset> = OnceLock::new();
+
+/// Called once, from `main`, before any thread is started.
+pub fn remember_local_clock() {
+    let _ = LOCAL.set(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+}
+
+/// A time as the person reading it keeps time.
+pub fn local(at: OffsetDateTime) -> OffsetDateTime {
+    at.to_offset(*LOCAL.get().unwrap_or(&time::UtcOffset::UTC))
+}
+
+pub fn now() -> OffsetDateTime {
+    local(OffsetDateTime::now_utc())
+}
 
 /// A file size the way a file manager writes it.
 ///
@@ -64,36 +88,6 @@ fn month(at: OffsetDateTime) -> &'static str {
     }
 }
 
-/// What kind of thing a file is, in the words a person would use.
-///
-/// Shown in the Type column, and deliberately broad: "Image" is more useful at a glance than
-/// "JPEG image", and Camion cannot open the file to find out more than its name suggests.
-pub fn kind(name: &str, is_folder: bool) -> &'static str {
-    if is_folder {
-        return "Folder";
-    }
-
-    let extension = name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "svg" | "ico" | "avif" => "Image",
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "mpg" | "mpeg" => "Video",
-        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "opus" | "aac" => "Audio",
-        "pdf" => "PDF document",
-        "zip" | "gz" | "bz2" | "xz" | "tar" | "7z" | "rar" | "zst" => "Archive",
-        "doc" | "docx" | "odt" | "rtf" => "Document",
-        "xls" | "xlsx" | "ods" | "csv" => "Spreadsheet",
-        "ppt" | "pptx" | "odp" => "Presentation",
-        "rs" | "py" | "js" | "ts" | "rb" | "go" | "c" | "h" | "cpp" | "java" | "sh" | "lua" => "Code",
-        "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "conf" | "cfg" => "Configuration",
-        "md" | "txt" | "log" => "Text",
-        "" => "File",
-        _ => "File",
-    }
-}
 
 /// A file:// URL as a path, which is what a drop from a file manager hands us.
 pub fn path_from_url(url: &str) -> Option<std::path::PathBuf> {
@@ -149,17 +143,6 @@ mod tests {
         let now = datetime!(2026-08-28 14:30 UTC);
 
         assert_eq!(modified(datetime!(2026-09-04 09:05 UTC), now), "4 Sep");
-    }
-
-    #[test]
-    fn a_file_is_described_in_words_a_person_would_use() {
-        assert_eq!(kind("photos", true), "Folder");
-        assert_eq!(kind("harbour.jpg", false), "Image");
-        assert_eq!(kind("invoice.PDF", false), "PDF document");
-        assert_eq!(kind("main.rs", false), "Code");
-        assert_eq!(kind("Cargo.toml", false), "Configuration");
-        assert_eq!(kind("README", false), "File");
-        assert_eq!(kind("mystery.wat", false), "File");
     }
 
     #[test]

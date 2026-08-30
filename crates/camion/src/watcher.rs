@@ -101,8 +101,11 @@ mod tests {
         );
     }
 
+    /// Not exactly once: a write can land just as the settle window closes and start a second
+    /// round, which is correct — it really is a later change. What matters is that twenty
+    /// writes do not become twenty theme reloads.
     #[test]
-    fn a_flurry_of_changes_is_reported_once_it_settles() {
+    fn a_flurry_of_changes_coalesces_into_a_report_or_two() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("watched");
         std::fs::create_dir_all(&directory).unwrap();
@@ -122,7 +125,6 @@ mod tests {
         wait_for(&changes, 1);
         std::thread::sleep(SETTLE * 4);
 
-        // Twenty writes in a burst are one change worth reacting to, not twenty.
         assert!(
             changes.load(Ordering::SeqCst) <= 3,
             "expected the burst to coalesce, saw {} callbacks",

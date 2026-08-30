@@ -49,7 +49,7 @@ impl SshConfig {
             };
 
             if keyword.eq_ignore_ascii_case("host") {
-                applies = value.split_whitespace().any(|pattern| matches(pattern, host));
+                applies = host_matches(value, host);
                 continue;
             }
 
@@ -99,15 +99,28 @@ fn split(line: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Whether a `Host` line applies, given all of its patterns.
+///
+/// A negation is only ever written beside a positive pattern — `Host * !shire` — so refusing to
+/// match on the negated one alone achieves nothing: the `*` still matches and the block still
+/// applies. One negated pattern has to veto the whole line.
+fn host_matches(patterns: &str, host: &str) -> bool {
+    let mut included = false;
+
+    for pattern in patterns.split_whitespace() {
+        match pattern.strip_prefix('!') {
+            Some(excluded) if matches(excluded, host) => return false,
+            Some(_) => {}
+            None => included |= matches(pattern, host),
+        }
+    }
+
+    included
+}
+
 /// The subset of shell globbing `ssh` uses for host patterns: `*` for any run of characters,
 /// `?` for exactly one, and everything else matched literally end to end.
 fn matches(pattern: &str, host: &str) -> bool {
-    // A negated pattern excludes rather than includes, and reading it as a match would apply
-    // exactly the settings it was written to avoid.
-    if pattern.starts_with('!') {
-        return false;
-    }
-
     let (pattern, host) = (pattern.as_bytes(), host.as_bytes());
     let (mut expected, mut at) = (0, 0);
     let (mut star, mut resumed) = (None, 0);
@@ -224,9 +237,22 @@ Host elsewhere
         assert!(!matches("web?.example.com", "web12.example.com"));
         assert!(matches("shire", "shire"));
         assert!(!matches("shire", "shire.local"));
+    }
 
-        // A pattern written to exclude a host must not be read as including it.
-        assert!(!matches("!shire", "shire"));
+    /// Asserted through `parse` rather than through the matcher, because a negation only means
+    /// anything beside the positive pattern it is written to carve out of.
+    #[test]
+    fn a_host_written_to_be_excluded_is_excluded() {
+        let contents = "Host * !shire\n  Port 2222\n";
+
+        assert_eq!(SshConfig::parse(contents, "shire").port, None);
+        assert_eq!(SshConfig::parse(contents, "elsewhere").port, Some(2222));
+    }
+
+    #[test]
+    fn a_line_of_only_negations_matches_nothing() {
+        assert!(!host_matches("!shire", "shire"));
+        assert!(!host_matches("!shire", "elsewhere"));
     }
 
     #[test]

@@ -121,16 +121,29 @@ impl Settings {
     }
 
     fn save(&self) {
-        let Some(path) = Self::path() else { return };
-        let Ok(contents) = toml::to_string_pretty(self) else {
-            return;
+        if let Err(reason) = self.write() {
+            // Not fatal — the window still looks the way it was just asked to. But silently
+            // forgetting it every time the application starts is the kind of thing people
+            // spend an afternoon on before finding out the directory is not writable.
+            crate::bus::publish(camion_engine::Event::Failed {
+                message: format!("your display settings could not be saved: {reason}"),
+            });
+        }
+    }
+
+    fn write(&self) -> std::io::Result<()> {
+        let Some(path) = Self::path() else {
+            return Ok(());
         };
 
+        let contents = toml::to_string_pretty(self)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+
         if let Some(directory) = path.parent() {
-            let _ = std::fs::create_dir_all(directory);
+            std::fs::create_dir_all(directory)?;
         }
 
-        let _ = std::fs::write(path, contents);
+        std::fs::write(path, contents)
     }
 
     fn step(&self) -> usize {
@@ -170,7 +183,7 @@ fn settings() -> &'static RwLock<Settings> {
     SETTINGS.get_or_init(|| RwLock::new(Settings::load()))
 }
 
-type Listener = Box<dyn Fn() + Send>;
+type Listener = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 fn listeners() -> &'static Mutex<Vec<Listener>> {
     static LISTENERS: OnceLock<Mutex<Vec<Listener>>> = OnceLock::new();
@@ -190,13 +203,17 @@ pub fn update(change: impl FnOnce(&mut Settings)) {
         settings.save();
     }
 
-    for listener in listeners().lock().unwrap().iter() {
+    // The list is copied before anything is called, so a listener is free to add another one
+    // without deadlocking on the lock it is being called under.
+    let listeners = listeners().lock().unwrap().clone();
+
+    for listener in listeners {
         listener();
     }
 }
 
-pub fn on_change(listener: impl Fn() + Send + 'static) {
-    listeners().lock().unwrap().push(Box::new(listener));
+pub fn on_change(listener: impl Fn() + Send + Sync + 'static) {
+    listeners().lock().unwrap().push(std::sync::Arc::new(listener));
 }
 
 #[cfg(test)]

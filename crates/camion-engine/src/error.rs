@@ -25,6 +25,9 @@ pub enum Error {
     #[error("{host} presented a different key than the one on file")]
     HostKeyChanged { host: String },
 
+    #[error("{path} could not be read: {reason}")]
+    LocalFile { path: String, reason: String },
+
     #[error("cancelled")]
     Cancelled,
 }
@@ -36,5 +39,9 @@ impl Error {
 
     pub fn config(message: impl std::fmt::Display) -> Self {
         Self::Config(message.to_string())
+    }
+
+    pub fn local_file(path: &std::path::Path, reason: impl std::fmt::Display) -> Self {
+        Self::LocalFile { path: path.display().to_string(), reason: reason.to_string() }
     }
 }

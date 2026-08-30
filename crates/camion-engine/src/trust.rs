@@ -28,7 +28,21 @@ impl PromptingTrust {
 #[async_trait]
 impl HostTrust for PromptingTrust {
     async fn verify(&self, key: &HostKey) -> Trust {
-        match self.known_hosts.verdict(key) {
+        let verdict = match self.known_hosts.verdict(key) {
+            Ok(verdict) => verdict,
+
+            // Every host would look unknown, and answering the prompt would append to a file
+            // that cannot be read. Refusing is the only honest answer.
+            Err(error) => {
+                (self.emit)(Event::Failed {
+                    message: format!("known_hosts could not be read, so {} cannot be verified: {error}", key.host),
+                });
+
+                return Trust::Rejected;
+            }
+        };
+
+        match verdict {
             Verdict::Known => Trust::Known,
 
             Verdict::Unknown => {
@@ -42,8 +56,15 @@ impl HostTrust for PromptingTrust {
 
                 if accepted {
                     // Written to the real `known_hosts`, so `ssh` from a terminal agrees with
-                    // Camion about what has been trusted, and neither asks twice.
-                    let _ = self.known_hosts.remember(key);
+                    // Camion about what has been trusted, and neither asks twice. Failing to
+                    // write it does not stop this connection, but it does mean being asked
+                    // again next time — which is worth saying rather than looking like a bug.
+                    if let Err(error) = self.known_hosts.remember(key) {
+                        (self.emit)(Event::Failed {
+                            message: format!("{} was trusted, but could not be written to known_hosts: {error}", key.host),
+                        });
+                    }
+
                     Trust::Accepted
                 } else {
                     Trust::Rejected
@@ -127,7 +148,7 @@ mod tests {
         let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept));
 
         assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Accepted);
-        assert_eq!(KnownHosts::new(&path).verdict(&host_key(KEY)), Verdict::Known);
+        assert_eq!(KnownHosts::new(&path).verdict(&host_key(KEY)).unwrap(), Verdict::Known);
     }
 
     #[tokio::test]

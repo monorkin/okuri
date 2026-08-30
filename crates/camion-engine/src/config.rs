@@ -100,10 +100,17 @@ impl Connections {
             return base;
         }
 
-        (2..)
-            .map(|suffix| format!("{base}-{suffix}"))
-            .find(|candidate| self.find(candidate).is_none())
-            .expect("an unused suffix")
+        let mut suffix = 2;
+
+        loop {
+            let candidate = format!("{base}-{suffix}");
+
+            if self.find(&candidate).is_none() {
+                return candidate;
+            }
+
+            suffix += 1;
+        }
     }
 }
 

@@ -204,8 +204,7 @@ impl Provider for WebDavProvider {
     }
 
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
-        // Streamed rather than collected, so uploading a large file never means holding it in
-        // memory first.
+        // Streamed rather than collected: a large file never has to fit in memory.
         let response = self
             .request(Method::PUT, &self.url(path))
             .body(reqwest::Body::wrap_stream(body))
@@ -260,8 +259,9 @@ impl Provider for WebDavProvider {
 fn expect_success(status: StatusCode, path: &RemotePath, doing: &str) -> Result<()> {
     match status {
         status if status.is_success() => Ok(()),
-        StatusCode::NOT_FOUND => Err(Error::NotFound { path: path.clone() }),
-        StatusCode::CONFLICT => Err(Error::NotFound { path: path.clone() }),
+        // A `409` from MKCOL or PUT means a folder along the way is missing, which is the
+        // same problem as a `404` and reads better said that way.
+        StatusCode::NOT_FOUND | StatusCode::CONFLICT => Err(Error::NotFound { path: path.clone() }),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             Err(Error::PermissionDenied { path: path.clone() })
         }

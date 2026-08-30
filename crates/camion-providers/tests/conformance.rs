@@ -149,9 +149,12 @@ async fn sftp_says_what_it_tried_to_sign_in_with() {
 
     let said = refused.to_string();
 
+    // Whatever this machine has, something was attempted and the refusal names it — even
+    // "no SSH agent" is an answer. Accepting either wording would let a refusal that explains
+    // nothing pass, which is the only thing this test is here to catch.
     assert!(said.contains("camion was not accepted by localhost"), "{said}");
-    assert!(said.contains("tried") || said.contains("nothing to sign in with"), "{said}");
-    println!("refusal reads: {said}");
+    assert!(said.contains("tried"), "{said}");
+    assert!(said.contains("agent"), "{said}");
 }
 
 /// What a file is called to the rest of the desktop has to be its whole path. A connection

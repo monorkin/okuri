@@ -93,7 +93,7 @@ impl cxx_qt::Initialize for qobject::Display {
         let thread = self.as_mut().qt_thread();
 
         crate::view::on_change(move || {
-            let _ = thread.queue(|display| display.publish());
+            crate::qt::queue(&thread, |display| display.publish());
         });
 
         self.publish();

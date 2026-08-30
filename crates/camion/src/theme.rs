@@ -49,22 +49,68 @@ pub mod qobject {
     impl cxx_qt::Initialize for Theme {}
 }
 
-pub struct ThemeRust {
-    dark: bool,
-    background: QString,
-    surface: QString,
-    elevated: QString,
-    foreground: QString,
-    bright: QString,
-    muted: QString,
-    accent: QString,
-    accent_text: QString,
-    selection: QString,
-    selection_text: QString,
-    border: QString,
-    error: QString,
-    warning: QString,
-    success: QString,
+/// Declares the palette's colours once, and writes the three lists that have to agree about
+/// them: the fields, how a [`Palette`] becomes them, and how each one is handed to Qt.
+///
+/// The bridge above names them a fourth time, because `#[qproperty]` has to be written out for
+/// CXX-Qt to see it. Everything below is generated, so adding a colour is one line there and
+/// one line here rather than four places to remember.
+macro_rules! colours {
+    ($($name:ident => $setter:ident),* $(,)?) => {
+        pub struct ThemeRust {
+            dark: bool,
+            $($name: QString,)*
+        }
+
+        impl From<Palette> for ThemeRust {
+            fn from(palette: Palette) -> Self {
+                let color = |color: crate::color::Color| QString::from(&color.to_string());
+
+                Self {
+                    dark: palette.dark,
+                    $($name: color(palette.$name),)*
+                }
+            }
+        }
+
+        impl qobject::Theme {
+            /// Assigns through the generated setters rather than replacing the struct, so Qt
+            /// emits a change signal for every colour that actually moved and for none that
+            /// did not.
+            ///
+            /// A palette that cannot be read right now leaves the current one alone. During a
+            /// theme switch there is a moment with no palette on disk at all, and flashing the
+            /// built-in colours through that gap would be worse than waiting for the new theme
+            /// to land.
+            pub fn reload(mut self: Pin<&mut Self>) {
+                let Some(palette) = Palette::current() else {
+                    return;
+                };
+
+                let refreshed = ThemeRust::from(palette);
+
+                self.as_mut().set_dark(refreshed.dark);
+                $(self.as_mut().$setter(refreshed.$name);)*
+            }
+        }
+    };
+}
+
+colours! {
+    background => set_background,
+    surface => set_surface,
+    elevated => set_elevated,
+    foreground => set_foreground,
+    bright => set_bright,
+    muted => set_muted,
+    accent => set_accent,
+    accent_text => set_accent_text,
+    selection => set_selection,
+    selection_text => set_selection_text,
+    border => set_border,
+    error => set_error,
+    warning => set_warning,
+    success => set_success,
 }
 
 impl Default for ThemeRust {
@@ -82,63 +128,9 @@ impl cxx_qt::Initialize for qobject::Theme {
         let thread = self.qt_thread();
 
         crate::desktop::on_theme_change(move || {
-            let _ = thread.queue(|theme| theme.reload());
+            crate::qt::queue(&thread, |theme| theme.reload());
         });
     }
 }
 
-impl From<Palette> for ThemeRust {
-    fn from(palette: Palette) -> Self {
-        let color = |color: crate::color::Color| QString::from(&color.to_string());
 
-        Self {
-            dark: palette.dark,
-            background: color(palette.background),
-            surface: color(palette.surface),
-            elevated: color(palette.elevated),
-            foreground: color(palette.foreground),
-            bright: color(palette.bright),
-            muted: color(palette.muted),
-            accent: color(palette.accent),
-            accent_text: color(palette.accent_text),
-            selection: color(palette.selection),
-            selection_text: color(palette.selection_text),
-            border: color(palette.border),
-            error: color(palette.error),
-            warning: color(palette.warning),
-            success: color(palette.success),
-        }
-    }
-}
-
-impl qobject::Theme {
-    /// Assigns through the generated setters rather than replacing the struct, so Qt emits a
-    /// change signal for every colour that actually moved and for none that did not.
-    ///
-    /// A palette that cannot be read right now leaves the current one alone. During a theme
-    /// switch there is a moment with no palette on disk at all, and flashing the built-in
-    /// colours through that gap would be worse than waiting for the new theme to land.
-    pub fn reload(mut self: Pin<&mut Self>) {
-        let Some(palette) = Palette::current() else {
-            return;
-        };
-
-        let refreshed = ThemeRust::from(palette);
-
-        self.as_mut().set_dark(refreshed.dark);
-        self.as_mut().set_background(refreshed.background);
-        self.as_mut().set_surface(refreshed.surface);
-        self.as_mut().set_elevated(refreshed.elevated);
-        self.as_mut().set_foreground(refreshed.foreground);
-        self.as_mut().set_bright(refreshed.bright);
-        self.as_mut().set_muted(refreshed.muted);
-        self.as_mut().set_accent(refreshed.accent);
-        self.as_mut().set_accent_text(refreshed.accent_text);
-        self.as_mut().set_selection(refreshed.selection);
-        self.as_mut().set_selection_text(refreshed.selection_text);
-        self.as_mut().set_border(refreshed.border);
-        self.as_mut().set_error(refreshed.error);
-        self.as_mut().set_warning(refreshed.warning);
-        self.as_mut().set_success(refreshed.success);
-    }
-}

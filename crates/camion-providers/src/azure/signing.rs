@@ -112,11 +112,13 @@ fn canonical_resource(account: &str, path: &str, query: &[(String, String)]) -> 
 
     parameters.sort();
 
-    parameters
-        .iter()
-        .fold(resource, |signed, (name, value)| {
-            format!("{signed}\n{name}:{value}")
-        })
+    let mut signed = resource;
+
+    for (name, value) in &parameters {
+        signed.push_str(&format!("\n{name}:{value}"));
+    }
+
+    signed
 }
 
 fn sign(key: &str, message: &str) -> Option<String> {

@@ -107,21 +107,17 @@ impl Destination {
 }
 
 /// The path, with the characters a URL cannot carry written the way a URL writes them.
+///
+/// Separators are left alone: they are the structure of the path, not part of a name.
 fn escape(path: &str) -> String {
-    path.split('/')
-        .map(|segment| {
-            segment
-                .bytes()
-                .map(|byte| match byte {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                        (byte as char).to_string()
-                    }
-                    byte => format!("%{byte:02X}"),
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~')
+        .remove(b'/');
+
+    percent_encoding::utf8_percent_encode(path, RESERVED).to_string()
 }
 
 fn port_suffix(port: u16, usual: u16) -> String {

@@ -142,13 +142,15 @@ impl qobject::ConnectionList {
         let name = fields.text("name");
         let id = fields.text("id");
 
+        let existing = self.rust().connections.find(&id).map(|found| found.destination.clone());
+
         let connection = Connection {
             id: match id.is_empty() {
                 true => self.rust().connections.unused_id(&name),
                 false => id,
             },
             name,
-            destination: fields.destination(),
+            destination: carried_over(fields.destination(), existing.as_ref()),
         };
 
         self.as_mut().rust_mut().connections.put(connection);
@@ -162,11 +164,9 @@ impl qobject::ConnectionList {
 
     pub fn id_at(&self, row: i32) -> QString {
         QString::from(
-            &self
-                .rust()
-                .connections
-                .entries
-                .get(row.max(0) as usize)
+            &usize::try_from(row)
+                .ok()
+                .and_then(|row| self.rust().connections.entries.get(row))
                 .map(|connection| connection.id.clone())
                 .unwrap_or_default(),
         )
@@ -254,6 +254,37 @@ impl qobject::ConnectionList {
     }
 }
 
+/// Puts back the settings the editor does not show.
+///
+/// The editor renders the fields a kind has to be typed in, which is not all of them: FTP also
+/// carries whether to use TLS and passive mode, and both file protocols remember which
+/// directory they start in. Rebuilding a destination from the form alone answers those with a
+/// default — so a plain-FTP connection would quietly become an encrypted one the first time
+/// anybody opened its settings and pressed Save.
+///
+/// Only carried between destinations of the same kind. Changing the kind really is a new
+/// destination, and there is nothing to carry.
+fn carried_over(edited: Destination, existing: Option<&Destination>) -> Destination {
+    match (edited, existing) {
+        (Destination::Ftp(edited), Some(Destination::Ftp(existing))) => Destination::Ftp(Ftp {
+            encrypted: existing.encrypted,
+            passive: existing.passive,
+            home: existing.home.clone(),
+            ..edited
+        }),
+        (Destination::Sftp(edited), Some(Destination::Sftp(existing))) => {
+            Destination::Sftp(Sftp { home: existing.home.clone(), ..edited })
+        }
+        (Destination::S3(edited), Some(Destination::S3(existing))) => {
+            Destination::S3(S3 { root: existing.root.clone(), ..edited })
+        }
+        (Destination::Azure(edited), Some(Destination::Azure(existing))) => {
+            Destination::Azure(Azure { root: existing.root.clone(), ..edited })
+        }
+        (edited, _) => edited,
+    }
+}
+
 /// The editor's fields, whichever of them the chosen kind asked for.
 struct Fields {
     values: QMap<QMapPair_QString_QVariant>,
@@ -313,7 +344,7 @@ impl Fields {
                 username: self.text("username"),
                 encrypted: true,
                 passive: true,
-                home: self.text("home"),
+                home: String::new(),
             }),
             "s3" => storage(S3Preset::Aws),
             "r2" => storage(S3Preset::CloudflareR2),
@@ -333,8 +364,83 @@ impl Fields {
                 port: self.port(22),
                 username: self.text("username"),
                 credential: self.credential(),
-                home: self.text("home"),
+                home: String::new(),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ftp(encrypted: bool) -> Destination {
+        Destination::Ftp(Ftp {
+            host: "files.example.com".to_owned(),
+            port: 21,
+            username: "camion".to_owned(),
+            encrypted,
+            passive: false,
+            home: "/home/camion".to_owned(),
+        })
+    }
+
+    /// The editor shows neither the TLS setting nor the login directory, so saving from it has
+    /// to leave both exactly as they were. Turning TLS on behind someone's back means their
+    /// connection stops working and the form gives no hint why.
+    #[test]
+    fn editing_a_connection_leaves_the_settings_the_editor_does_not_show() {
+        let Destination::Ftp(saved) = carried_over(ftp(true), Some(&ftp(false))) else {
+            panic!("still an FTP connection");
+        };
+
+        assert!(!saved.encrypted);
+        assert!(!saved.passive);
+        assert_eq!(saved.home, "/home/camion");
+        assert_eq!(saved.host, "files.example.com");
+    }
+
+    #[test]
+    fn changing_the_kind_carries_nothing_over() {
+        let changed = carried_over(Destination::Memory, Some(&ftp(false)));
+
+        assert!(matches!(changed, Destination::Memory));
+    }
+
+    #[test]
+    fn a_new_connection_has_nothing_to_carry_over() {
+        let Destination::Ftp(new) = carried_over(ftp(true), None) else {
+            panic!("still an FTP connection");
+        };
+
+        assert!(new.encrypted);
+    }
+
+    /// Every kind the editor offers has to build something, or choosing it from the menu makes
+    /// an SFTP connection with the fields of whatever was actually filled in.
+    #[test]
+    fn every_kind_the_editor_offers_builds_its_own_destination() {
+        let built = |kind: &str| {
+            let mut values = QMap::<QMapPair_QString_QVariant>::default();
+            values.insert(QString::from("kind"), QVariant::from(&QString::from(kind)));
+
+            Fields::from(&values).destination().kind().to_owned()
+        };
+
+        // Paired with the label each one shows in the list, which is how anyone would notice
+        // that choosing B2 had quietly made an ordinary S3 connection.
+        let kinds = [
+            ("sftp", "SFTP"),
+            ("ftp", "FTP"),
+            ("s3", "Amazon S3"),
+            ("r2", "Cloudflare R2"),
+            ("b2", "Backblaze B2"),
+            ("webdav", "WebDAV"),
+            ("azure", "Azure Blob Storage"),
+        ];
+
+        for (kind, label) in kinds {
+            assert_eq!(built(kind), label, "{kind}");
         }
     }
 }

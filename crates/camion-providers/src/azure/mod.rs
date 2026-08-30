@@ -12,6 +12,7 @@ use reqwest::{Client, Method, StatusCode};
 use time::OffsetDateTime;
 
 use crate::destination::Azure as AzureConfig;
+use crate::keys::{last_segment, normalize_root, parse_http_date, rebase};
 use crate::secret::Secret;
 
 /// Azure Blob Storage.
@@ -99,6 +100,8 @@ impl AzureProvider {
         mut headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<reqwest::Response> {
+        // Azure wants `Tue, 26 Aug 2026 10:00:00 GMT`, which is RFC 2822 with the offset
+        // spelled the way HTTP spells it rather than as `+0000`.
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc2822)
             .map_err(|error| Error::caused_by("could not stamp the request", error))?
@@ -156,33 +159,55 @@ impl AzureProvider {
         format!("/{}/{encoded}", self.container)
     }
 
+    /// Everything under a prefix, following the markers to the end.
+    ///
+    /// A container answers at most five thousand blobs at a time and names where to resume.
+    /// Stopping at the first answer would make a large folder look complete when it is not —
+    /// and deleting one would report success having removed a fraction of it.
     async fn list_blobs(&self, prefix: &str, delimited: bool) -> Result<Listing> {
-        let mut query = vec![
-            ("restype".to_owned(), "container".to_owned()),
-            ("comp".to_owned(), "list".to_owned()),
-            ("prefix".to_owned(), prefix.to_owned()),
-        ];
+        let mut listing = Listing::default();
+        let mut resume: Option<String> = None;
 
-        if delimited {
-            query.push(("delimiter".to_owned(), "/".to_owned()));
+        loop {
+            let mut query = vec![
+                ("restype".to_owned(), "container".to_owned()),
+                ("comp".to_owned(), "list".to_owned()),
+                ("prefix".to_owned(), prefix.to_owned()),
+            ];
+
+            if delimited {
+                query.push(("delimiter".to_owned(), "/".to_owned()));
+            }
+
+            if let Some(marker) = &resume {
+                query.push(("marker".to_owned(), marker.clone()));
+            }
+
+            let response = self
+                .send(Method::GET, &self.container_path(), &query, HeaderMap::new(), Vec::new())
+                .await?;
+
+            let status = response.status();
+
+            if !status.is_success() {
+                return Err(refused(status, &RemotePath::root(), "list the container"));
+            }
+
+            let body = response
+                .text()
+                .await
+                .map_err(|error| Error::caused_by("the listing could not be read", error))?;
+
+            let page = parse_listing(&body)?;
+
+            resume = page.next.clone();
+            listing.blobs.extend(page.blobs);
+            listing.folders.extend(page.folders);
+
+            if resume.is_none() {
+                return Ok(listing);
+            }
         }
-
-        let response = self
-            .send(Method::GET, &self.container_path(), &query, HeaderMap::new(), Vec::new())
-            .await?;
-
-        let status = response.status();
-
-        if !status.is_success() {
-            return Err(refused(status, "list the container"));
-        }
-
-        let body = response
-            .text()
-            .await
-            .map_err(|error| Error::caused_by("the listing could not be read", error))?;
-
-        parse_listing(&body)
     }
 
     async fn upload_in_blocks(&self, path: &RemotePath, mut body: ByteStream) -> Result<()> {
@@ -190,39 +215,30 @@ impl AzureProvider {
 
         let encoding = base64::engine::general_purpose::STANDARD;
         let mut blocks = Vec::new();
-        let mut buffer = Vec::with_capacity(BLOCK_SIZE);
-        let mut finished = false;
 
-        while !finished {
-            match body.next().await {
-                Some(chunk) => buffer.extend_from_slice(&chunk?),
-                None => finished = true,
+        while let Some(block) = crate::parts::next_part(&mut body, BLOCK_SIZE).await? {
+            // Block ids have to be the same length for every block in one blob, so they are a
+            // fixed-width number rather than anything more descriptive.
+            let id = encoding.encode(format!("camion-{:08}", blocks.len()));
+
+            let response = self
+                .send(
+                    Method::PUT,
+                    &self.blob_path(path),
+                    &[
+                        ("comp".to_owned(), "block".to_owned()),
+                        ("blockid".to_owned(), id.clone()),
+                    ],
+                    HeaderMap::new(),
+                    block,
+                )
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(refused(response.status(), path, "upload"));
             }
 
-            if buffer.len() >= BLOCK_SIZE || (finished && !buffer.is_empty()) {
-                // Block ids have to be the same length for every block in one blob, so they
-                // are a fixed-width number rather than anything more descriptive.
-                let id = encoding.encode(format!("camion-{:08}", blocks.len()));
-
-                let response = self
-                    .send(
-                        Method::PUT,
-                        &self.blob_path(path),
-                        &[
-                            ("comp".to_owned(), "block".to_owned()),
-                            ("blockid".to_owned(), id.clone()),
-                        ],
-                        HeaderMap::new(),
-                        std::mem::take(&mut buffer),
-                    )
-                    .await?;
-
-                if !response.status().is_success() {
-                    return Err(refused(response.status(), "upload"));
-                }
-
-                blocks.push(id);
-            }
+            blocks.push(id);
         }
 
         let list = blocks
@@ -245,7 +261,7 @@ impl AzureProvider {
 
         match response.status().is_success() {
             true => Ok(()),
-            false => Err(refused(response.status(), "finish the upload")),
+            false => Err(refused(response.status(), path, "finish the upload")),
         }
     }
 }
@@ -339,12 +355,8 @@ impl Provider for AzureProvider {
             .send(Method::GET, &self.blob_path(path), &[], headers, Vec::new())
             .await?;
 
-        if response.status() == StatusCode::NOT_FOUND {
-            return Err(Error::NotFound { path: path.clone() });
-        }
-
         if !response.status().is_success() {
-            return Err(refused(response.status(), "download"));
+            return Err(refused(response.status(), path, "download"));
         }
 
         let size = response.content_length();
@@ -359,7 +371,7 @@ impl Provider for AzureProvider {
         // Shared Key signs the content length, so a body of unknown size cannot go up in one
         // request. Small and known goes as a single blob; everything else is staged in blocks.
         let single = match body.size() {
-            Some(size) => (size as usize) <= BLOCK_SIZE,
+            Some(size) => size <= BLOCK_SIZE as u64,
             None => false,
         };
 
@@ -382,7 +394,7 @@ impl Provider for AzureProvider {
 
         match response.status().is_success() {
             true => Ok(()),
-            false => Err(refused(response.status(), "upload")),
+            false => Err(refused(response.status(), path, "upload")),
         }
     }
 
@@ -412,7 +424,7 @@ impl Provider for AzureProvider {
                 .await?;
 
             if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
-                return Err(refused(response.status(), "delete"));
+                return Err(refused(response.status(), path, "delete"));
             }
         }
 
@@ -434,7 +446,7 @@ impl Provider for AzureProvider {
 
         match response.status().is_success() {
             true => Ok(()),
-            false => Err(refused(response.status(), "create the folder")),
+            false => Err(refused(response.status(), path, "create the folder")),
         }
     }
 
@@ -461,7 +473,7 @@ impl Provider for AzureProvider {
 
         for name in &moved {
             let renamed = match entry.kind.is_folder() {
-                true => format!("{destination}{}", name.trim_start_matches(&source)),
+                true => rebase(name, &source, &destination),
                 false => self.blob_name(to),
             };
 
@@ -476,7 +488,22 @@ impl Provider for AzureProvider {
                 .await?;
 
             if !response.status().is_success() {
-                return Err(refused(response.status(), "copy"));
+                return Err(refused(response.status(), from, "copy"));
+            }
+
+            // Copy Blob answers `202 Accepted` and goes on copying afterwards. Deleting the
+            // source on the strength of that would take the file away mid-copy, so the answer
+            // has to say the copy is already done.
+            let finished = response
+                .headers()
+                .get("x-ms-copy-status")
+                .and_then(|status| status.to_str().ok())
+                .is_none_or(|status| status == "success");
+
+            if !finished {
+                return Err(Error::provider(format!(
+                    "{name} is still being copied; nothing has been removed"
+                )));
             }
         }
 
@@ -488,6 +515,8 @@ impl Provider for AzureProvider {
 struct Listing {
     blobs: Vec<Blob>,
     folders: Vec<String>,
+    /// Where the next page starts, when the container had more to say.
+    next: Option<String>,
 }
 
 impl Listing {
@@ -543,6 +572,7 @@ fn parse_listing(body: &str) -> Result<Listing> {
                 }
 
                 match inside.as_str() {
+                    "nextmarker" => listing.next = Some(value),
                     "name" if in_prefix => prefix = value,
                     "name" if in_blob => blob.name = value,
                     "content-length" if in_blob => blob.length = value.parse().unwrap_or_default(),
@@ -584,16 +614,6 @@ fn parse_listing(body: &str) -> Result<Listing> {
     }
 }
 
-fn last_segment(name: &str, prefix: &str) -> Option<String> {
-    let name = name.strip_prefix(prefix)?.trim_end_matches('/');
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_owned())
-    }
-}
-
 /// The path a URL carries after its host, which is empty for the usual Azure endpoint and
 /// `/account` for the emulator.
 fn path_of(endpoint: &str) -> String {
@@ -606,24 +626,6 @@ fn path_of(endpoint: &str) -> String {
         Some(at) => after_scheme[at..].trim_end_matches('/').to_owned(),
         None => String::new(),
     }
-}
-
-fn normalize_root(root: &str) -> String {
-    let root = root.trim_matches('/');
-
-    if root.is_empty() {
-        String::new()
-    } else {
-        format!("{root}/")
-    }
-}
-
-fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(
-        &value.replace("GMT", "+0000"),
-        &time::format_description::well_known::Rfc2822,
-    )
-    .ok()
 }
 
 /// The query as it goes on the wire. Built here rather than by the HTTP client because it has
@@ -649,8 +651,9 @@ fn header_value(value: &str) -> Result<HeaderValue> {
         .map_err(|error| Error::caused_by("a request header could not be built", error))
 }
 
-fn refused(status: StatusCode, doing: &str) -> Error {
+fn refused(status: StatusCode, path: &RemotePath, doing: &str) -> Error {
     match status {
+        StatusCode::NOT_FOUND => Error::NotFound { path: path.clone() },
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             Error::Authentication(format!("the account key was refused ({status})"))
         }
@@ -695,11 +698,17 @@ mod tests {
         assert_eq!(path_of("http://127.0.0.1:10000/devstoreaccount1/"), "/devstoreaccount1");
     }
 
+    /// A container that answers in pages says where the next one starts, and forgetting to
+    /// read that is how a folder looks complete when it is not.
     #[test]
-    fn names_are_what_is_left_after_the_prefix() {
-        assert_eq!(last_segment("photos/2026/", "photos/"), Some("2026".to_owned()));
-        assert_eq!(last_segment("photos/a.jpg", "photos/"), Some("a.jpg".to_owned()));
-        assert_eq!(last_segment("photos/", "photos/"), None);
+    fn a_listing_says_where_it_left_off() {
+        let listing = parse_listing(
+            r##"<EnumerationResults><Blobs/><NextMarker>2!go-on</NextMarker></EnumerationResults>"##,
+        )
+        .unwrap();
+
+        assert_eq!(listing.next.as_deref(), Some("2!go-on"));
+        assert_eq!(parse_listing(LISTING).unwrap().next, None);
     }
 
     #[test]

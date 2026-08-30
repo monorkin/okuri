@@ -70,7 +70,9 @@ impl Engine {
     }
 
     pub fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+        // The engine thread lives as long as the app does. If its channel has closed, every
+        // command from here on would vanish and the window would simply stop responding.
+        self.commands.send(command).expect("the engine thread to be running");
     }
 }
 
@@ -117,14 +119,7 @@ impl Running {
             Command::Connect(connection) => self.connect(*connection).await,
             Command::Disconnect(session) => self.disconnect(session).await,
             Command::Open { session, path } => self.open(session, path).await,
-            Command::Refresh(session) => {
-                let path = self.session(session).map(|session| session.path());
-
-                match path {
-                    Ok(path) => self.open(session, path).await,
-                    Err(error) => Err(error),
-                }
-            }
+            Command::Refresh(session) => self.refresh(session).await,
             Command::CreateFolder { session, name } => self.create_folder(session, &name).await,
             Command::Rename { session, from, to } => self.rename(session, &from, &to).await,
             Command::Move { session, from, names, into } => {
@@ -201,34 +196,9 @@ impl Running {
         }
     }
 
-    /// Fetches the secret a destination needs, asking for it when the store has none, and then
-    /// hands both it and the host-key check to the provider.
+    /// Opens a connection, asking for whatever it turns out to need along the way.
     async fn open_connection(&self, connection: &Connection) -> Result<Arc<dyn Provider>> {
-        let mut secret = self.secrets.get(&connection.id)?;
-        let shape = connection.destination.secret_shape();
-
-        if shape != SecretShape::None && secret.is_none() {
-            let name = connection.name.clone();
-
-            // What is asked for follows what the destination needs: one field for a password,
-            // two for the key pairs the object stores want.
-            let answer = match shape {
-                SecretShape::KeyPair => self.ask(Question::KeyPair { connection: name }).await,
-                _ => self.ask(Question::Password { connection: name }).await,
-            };
-
-            secret = match (answer.text(), answer.pair()) {
-                (Some(password), _) => Secret::Password(password.to_owned()),
-                (_, Some((id, key))) => Secret::KeyPair {
-                    id: id.to_owned(),
-                    secret: key.to_owned(),
-                },
-                _ => return Err(Error::Cancelled),
-            };
-
-            self.secrets.set(&connection.id, &secret)?;
-        }
-
+        let secret = self.secret_for(connection).await?;
         let trust = Arc::clone(&self.trust) as Arc<dyn camion_providers::HostTrust>;
         let opened =
             camion_providers::connect(&connection.destination, &secret, Arc::clone(&trust)).await;
@@ -239,6 +209,45 @@ impl Running {
             return Ok(opened?);
         };
 
+        let secret = self.ask_for_passphrase(connection, path).await?;
+
+        Ok(camion_providers::connect(&connection.destination, &secret, trust).await?)
+    }
+
+    /// The secret this destination needs, from the store if it is there and from the person at
+    /// the keyboard if it is not.
+    async fn secret_for(&self, connection: &Connection) -> Result<Secret> {
+        let stored = self.secrets.get(&connection.id)?;
+        let shape = connection.destination.secret_shape();
+
+        if shape == SecretShape::None || !stored.is_none() {
+            return Ok(stored);
+        }
+
+        let name = connection.name.clone();
+
+        // What is asked for follows what the destination needs: one field for a password, two
+        // for the key pairs the object stores want.
+        let answer = match shape {
+            SecretShape::KeyPair => self.ask(Question::KeyPair { connection: name }).await,
+            _ => self.ask(Question::Password { connection: name }).await,
+        };
+
+        let secret = match (answer.text(), answer.pair()) {
+            (Some(password), _) => Secret::Password(password.to_owned()),
+            (_, Some((id, key))) => Secret::KeyPair {
+                id: id.to_owned(),
+                secret: key.to_owned(),
+            },
+            _ => return Err(Error::Cancelled),
+        };
+
+        self.secrets.set(&connection.id, &secret)?;
+
+        Ok(secret)
+    }
+
+    async fn ask_for_passphrase(&self, connection: &Connection, path: String) -> Result<Secret> {
         let answer = self.ask(Question::KeyPassphrase { path }).await;
 
         let Some(passphrase) = answer.text() else {
@@ -248,18 +257,31 @@ impl Running {
         let secret = Secret::Password(passphrase.to_owned());
         self.secrets.set(&connection.id, &secret)?;
 
-        Ok(camion_providers::connect(&connection.destination, &secret, trust).await?)
+        Ok(secret)
     }
 
     async fn disconnect(&self, id: SessionId) -> Result<()> {
         let session = self.sessions.lock().unwrap().remove(&id);
 
         if let Some(session) = session {
-            let _ = session.provider.disconnect().await;
+            // The connection is gone from the registry either way, but a server that would not
+            // let go is worth saying out loud rather than leaving a half-closed socket behind.
+            if let Err(error) = session.provider.disconnect().await {
+                self.report(error.into());
+            }
+
             self.emit(Event::Disconnected { session: id });
         }
 
         Ok(())
+    }
+
+    /// Lists the folder a connection is already looking at, which is what everything that
+    /// changes the contents of one asks for afterwards.
+    async fn refresh(&self, id: SessionId) -> Result<()> {
+        let path = self.session(id)?.path();
+
+        self.open(id, path).await
     }
 
     async fn open(&self, id: SessionId, path: RemotePath) -> Result<()> {
@@ -284,7 +306,7 @@ impl Running {
         let path = session.path().join(name)?;
 
         session.provider.create_folder(&path).await?;
-        self.open(id, session.path()).await
+        self.refresh(id).await
     }
 
     async fn rename(&self, id: SessionId, from: &str, to: &str) -> Result<()> {
@@ -333,7 +355,7 @@ impl Running {
 
         // Whichever folder is open now is the one that has to be redrawn — it may be the one
         // they left, the one they arrived in, or neither.
-        self.open(id, session.path()).await
+        self.refresh(id).await
     }
 
     async fn delete(&self, id: SessionId, names: Vec<String>) -> Result<()> {
@@ -359,10 +381,13 @@ impl Running {
         let session = self.session(id)?;
 
         for source in sources {
+            // A path with nothing on the end of it would upload as a file with no name, which
+            // every destination reads as a folder marker or refuses outright.
             let name = source
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .ok_or_else(|| Error::local_file(&source, "it has no file name"))?
+                .to_string_lossy()
+                .into_owned();
 
             let destination = into.join(&name)?;
             let mut transfer = Transfer::new(
@@ -448,7 +473,7 @@ impl Running {
 
         // The folder is made even when it holds nothing, so an empty one still arrives.
         tokio::fs::create_dir_all(&destination).await.map_err(|error| {
-            Error::config(format!("could not create {}: {error}", destination.display()))
+            Error::local_file(&destination, error)
         })?;
 
         for child in session.provider.list(&source).await? {
@@ -507,11 +532,10 @@ impl Running {
 
             // Dropping ten files should redraw the list once, when the last one lands — not
             // ten times, and not only when the person thinks to press refresh.
-            if let Ok(session) = engine.session(on)
-                && lands_remotely
-                && !engine.still_working(on)
+            if engine.session(on).is_ok() && lands_remotely && !engine.still_working(on)
+                && let Err(error) = engine.refresh(on).await
             {
-                let _ = engine.open(on, session.path()).await;
+                engine.report(error);
             }
 
             outcome
@@ -557,7 +581,7 @@ async fn send_up(
 ) -> Result<()> {
     let file = tokio::fs::File::open(&source)
         .await
-        .map_err(|error| Error::config(format!("could not open {}: {error}", source.display())))?;
+        .map_err(|error| Error::local_file(&source, error))?;
 
     let size = file.metadata().await.ok().map(|metadata| metadata.len());
     let chunks = futures::StreamExt::map(tokio_util::io::ReaderStream::new(file), |chunk| {
@@ -586,11 +610,11 @@ async fn bring_down(
     ));
 
     let mut file = tokio::fs::File::create(&destination).await.map_err(|error| {
-        Error::config(format!("could not create {}: {error}", destination.display()))
+        Error::local_file(&destination, error)
     })?;
 
     tokio::io::copy(&mut reader, &mut file).await.map_err(|error| {
-        Error::config(format!("could not write {}: {error}", destination.display()))
+        Error::local_file(&destination, error)
     })?;
 
     Ok(())

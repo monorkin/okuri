@@ -10,8 +10,8 @@ use std::sync::Mutex;
 /// nothing and inherit the rest, so resolving `Yaru-yellow` without walking its `Inherits` line
 /// finds no mimetype icons at all.
 pub struct Icons {
-    pub(crate) themes: Vec<PathBuf>,
-    pub(crate) resolved: Mutex<HashMap<String, String>>,
+    themes: Vec<PathBuf>,
+    resolved: Mutex<HashMap<String, String>>,
 }
 
 /// Where themes live, most specific first.
@@ -27,11 +27,15 @@ impl Icons {
     /// which the specification requires every theme to fall back to.
     pub fn new() -> Self {
         let mut themes = Vec::new();
-        let mut pending = vec![current_theme()];
-        let mut seen = Vec::new();
 
-        while let Some(name) = pending.pop() {
-            if seen.contains(&name) {
+        // Taken from the front, because `Inherits` is written in order of preference and a
+        // stack would search the last-named theme first — which is how an icon comes back from
+        // the fallback theme when the one the person chose has its own.
+        let mut pending = std::collections::VecDeque::from([current_theme()]);
+        let mut seen = std::collections::HashSet::new();
+
+        while let Some(name) = pending.pop_front() {
+            if !seen.insert(name.clone()) {
                 continue;
             }
 
@@ -39,12 +43,18 @@ impl Icons {
                 pending.extend(inherited(&directory));
                 themes.push(directory);
             }
-
-            seen.push(name);
         }
 
         themes.extend(theme_directories("hicolor"));
 
+        Self::in_themes(themes)
+    }
+
+    /// A lookup over exactly these theme directories, in this order.
+    ///
+    /// The empty list is a real configuration: a machine with no icon theme installed answers
+    /// nothing for everything, and the interface draws its own mark instead.
+    pub fn in_themes(themes: Vec<PathBuf>) -> Self {
         Self { themes, resolved: Mutex::new(HashMap::new()) }
     }
 
@@ -53,12 +63,7 @@ impl Icons {
     /// An empty answer is a real one: the interface falls back to its own mark rather than
     /// showing a broken image.
     pub fn for_file(&self, name: &str, is_folder: bool) -> String {
-        let wanted = match is_folder {
-            true => vec!["folder".to_owned()],
-            false => icon_names(name),
-        };
-
-        for candidate in wanted {
+        for candidate in icon_names(name, is_folder) {
             if let Some(found) = self.find(&candidate) {
                 return found;
             }
@@ -139,40 +144,9 @@ fn candidates(theme: &Path, context: &str, name: &str) -> Vec<PathBuf> {
 }
 
 /// The icon names to try for a file, most specific first.
-///
-/// Themes disagree about which of these they ship — one has `application-zip`, another only
-/// `application-x-archive` — so each kind offers its alternatives and the first that exists
-/// wins.
-fn icon_names(name: &str) -> Vec<String> {
-    let extension = name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let names: &[&str] = match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "svg" | "ico" | "avif" => {
-            &["image-x-generic", "image"]
-        }
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "mpg" | "mpeg" => {
-            &["video-x-generic", "video"]
-        }
-        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "opus" | "aac" => &["audio-x-generic", "audio"],
-        "pdf" => &["application-pdf", "x-office-document"],
-        "zip" | "gz" | "bz2" | "xz" | "tar" | "7z" | "rar" | "zst" => {
-            &["package-x-generic", "application-x-archive", "application-zip"]
-        }
-        "doc" | "docx" | "odt" | "rtf" => &["x-office-document", "text-x-generic"],
-        "xls" | "xlsx" | "ods" | "csv" => &["x-office-spreadsheet", "text-x-generic"],
-        "ppt" | "pptx" | "odp" => &["x-office-presentation", "text-x-generic"],
-        "rs" | "py" | "js" | "ts" | "rb" | "go" | "c" | "h" | "cpp" | "java" | "sh" | "lua"
-        | "toml" | "json" | "yaml" | "yml" | "xml" | "html" | "css" | "sql" => {
-            &["text-x-script", "text-x-generic"]
-        }
-        "md" | "txt" | "log" | "conf" | "ini" | "cfg" => &["text-x-generic", "text-plain"],
-        _ => &[],
-    };
-
-    names
+fn icon_names(name: &str, is_folder: bool) -> Vec<String> {
+    crate::kinds::of(name, is_folder)
+        .icons
         .iter()
         .map(|name| name.to_string())
         // Every list ends the same way, so an unknown extension still gets a document rather
@@ -266,23 +240,28 @@ mod tests {
 
     #[test]
     fn a_file_is_matched_by_its_extension() {
-        assert_eq!(icon_names("harbour.jpg")[0], "image-x-generic");
-        assert_eq!(icon_names("talk.mp3")[0], "audio-x-generic");
-        assert_eq!(icon_names("invoice.PDF")[0], "application-pdf");
-        assert_eq!(icon_names("main.rs")[0], "text-x-script");
-        assert_eq!(icon_names("site.tar.gz")[0], "package-x-generic");
+        assert_eq!(icon_names("harbour.jpg", false)[0], "image-x-generic");
+        assert_eq!(icon_names("talk.mp3", false)[0], "audio-x-generic");
+        assert_eq!(icon_names("invoice.PDF", false)[0], "application-pdf");
+        assert_eq!(icon_names("main.rs", false)[0], "text-x-script");
+        assert_eq!(icon_names("site.tar.gz", false)[0], "package-x-generic");
+    }
+
+    #[test]
+    fn a_folder_asks_for_a_folder() {
+        assert_eq!(icon_names("documents", true)[0], "folder");
     }
 
     #[test]
     fn anything_unrecognised_still_gets_a_document() {
-        assert_eq!(icon_names("mystery"), vec!["text-x-generic", "application-x-generic"]);
-        assert_eq!(icon_names("data.wat"), vec!["text-x-generic", "application-x-generic"]);
+        assert_eq!(icon_names("mystery", false), vec!["text-x-generic", "application-x-generic"]);
+        assert_eq!(icon_names("data.wat", false), vec!["text-x-generic", "application-x-generic"]);
     }
 
     #[test]
     fn every_kind_falls_back_to_something_generic() {
         for name in ["a.jpg", "b.mp4", "c.pdf", "d.zip", "e.rs", "f"] {
-            let names = icon_names(name);
+            let names = icon_names(name, false);
 
             assert_eq!(
                 names.last().map(String::as_str),
@@ -334,17 +313,31 @@ mod tests {
     /// broken images, so an empty answer is a valid one.
     #[test]
     fn a_missing_icon_is_an_empty_answer_not_a_panic() {
-        let icons = Icons { themes: Vec::new(), resolved: Mutex::new(HashMap::new()) };
+        let icons = Icons::in_themes(Vec::new());
 
         assert_eq!(icons.for_file("notes.txt", false), "");
         assert_eq!(icons.for_file("documents", true), "");
     }
 
+    /// A listing asks for the same handful of names over and over, and every miss is a walk
+    /// through every theme on the machine. Asserted by taking the file away between the two
+    /// lookups: only an answer that was remembered can still be given.
     #[test]
     fn a_second_lookup_of_the_same_name_is_answered_from_memory() {
-        let icons = Icons { themes: Vec::new(), resolved: Mutex::new(HashMap::new()) };
+        let directory = tempfile::tempdir().unwrap();
+        let mimetypes = directory.path().join("48x48/mimetypes");
+        let icon = mimetypes.join("text-x-generic.png");
 
-        icons.for_file("notes.txt", false);
-        assert!(icons.resolved.lock().unwrap().contains_key("text-x-generic"));
+        std::fs::create_dir_all(&mimetypes).unwrap();
+        std::fs::write(&icon, b"").unwrap();
+
+        let icons = Icons::in_themes(vec![directory.path().to_path_buf()]);
+
+        let first = icons.for_file("notes.txt", false);
+        assert!(first.ends_with("text-x-generic.png"), "{first}");
+
+        std::fs::remove_file(&icon).unwrap();
+
+        assert_eq!(icons.for_file("changelog.txt", false), first);
     }
 }

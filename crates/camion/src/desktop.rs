@@ -1,12 +1,13 @@
+//! One watch on the desktop's appearance, shared by everything that follows it.
+//!
+//! Colours and icons both change when the theme does, and they live in the same directory — so
+//! there is one watch and a list of things to tell, rather than a watch per object all waking
+//! up for the same event.
+
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// One watch on the desktop's appearance, shared by everything that follows it.
-///
-/// Colours and icons both change when the theme does, and they live in the same directory —
-/// so there is one watch and a list of things to tell, rather than a watch per object all
-/// waking up for the same event.
-type Listener = Box<dyn Fn() + Send>;
+type Listener = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 fn listeners() -> &'static Mutex<Vec<Listener>> {
     static LISTENERS: OnceLock<Mutex<Vec<Listener>>> = OnceLock::new();
@@ -28,8 +29,8 @@ const SETTLE: Duration = Duration::from_millis(150);
 ///
 /// `omarchy-theme-set` deletes the theme directory and moves the new one into its place, so the
 /// directory above it is what gets watched — the one whose name does not change.
-pub fn on_theme_change(listener: impl Fn() + Send + 'static) {
-    listeners().lock().unwrap().push(Box::new(listener));
+pub fn on_theme_change(listener: impl Fn() + Send + Sync + 'static) {
+    listeners().lock().unwrap().push(std::sync::Arc::new(listener));
 
     let mut watcher = watcher().lock().unwrap();
 
@@ -45,7 +46,11 @@ pub fn on_theme_change(listener: impl Fn() + Send + 'static) {
 }
 
 fn announce() {
-    for listener in listeners().lock().unwrap().iter() {
+    // The list is copied before anything is called, so a listener is free to add another one
+    // without deadlocking on the lock it is being called under.
+    let listeners = listeners().lock().unwrap().clone();
+
+    for listener in listeners {
         listener();
     }
 }

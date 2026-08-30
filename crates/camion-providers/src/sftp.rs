@@ -91,17 +91,8 @@ impl SftpProvider {
         })
     }
 
-    /// Turns a path the UI is holding into one the server understands, by hanging it off the
-    /// directory this connection calls its root.
     fn absolute(&self, path: &RemotePath) -> String {
-        if path.is_root() {
-            match self.home.is_empty() {
-                true => "/".to_owned(),
-                false => self.home.clone(),
-            }
-        } else {
-            format!("{}/{}", self.home, path.to_key())
-        }
+        crate::keys::under(&self.home, path)
     }
 }
 
@@ -149,18 +140,20 @@ impl Provider for SftpProvider {
             .await
             .map_err(|error| translate(error, path))?;
 
+        // Not defaulted to zero: that would read a file the server has as an empty one and
+        // call the download a success.
         let size = file
             .metadata()
             .await
-            .ok()
-            .and_then(|metadata| metadata.size)
-            .unwrap_or_default();
+            .map_err(|error| translate(error, path))?
+            .size
+            .ok_or_else(|| Error::provider(format!("{path} has no size")))?;
 
         let (offset, length) = match range {
             None => (0, size),
             Some(range) => {
                 let offset = range.offset.min(size);
-                (offset, range.length.unwrap_or(size - offset).min(size - offset))
+                (offset, range.length.unwrap_or(u64::MAX).min(size - offset))
             }
         };
 
@@ -321,87 +314,121 @@ async fn authenticate_like_ssh(
 ) -> Result<Attempt> {
     let mut attempt = Attempt::default();
 
-    match agent(ssh).await {
-        Ok(Some(mut agent)) => {
-            let identities = agent.request_identities().await.unwrap_or_default();
+    offer_agent_keys(connection, username, ssh, &mut attempt).await;
 
-            if identities.is_empty() {
-                attempt.tried.push("the SSH agent, which is holding no keys".to_owned());
-            }
-
-            for identity in identities {
-                let (key, name) = match identity {
-                    russh::keys::agent::AgentIdentity::PublicKey { key, comment } => (key, comment),
-                    russh::keys::agent::AgentIdentity::Certificate { certificate, comment } => (
-                        russh::keys::PublicKey::new(certificate.public_key().clone(), ""),
-                        comment,
-                    ),
-                };
-
-                let signed = connection
-                    .authenticate_publickey_with(
-                        username,
-                        key,
-                        Some(russh::keys::HashAlg::Sha256),
-                        &mut agent,
-                    )
-                    .await;
-
-                match signed {
-                    Ok(result) if result.success() => {
-                        attempt.accepted = true;
-
-                        return Ok(attempt);
-                    }
-                    Ok(_) => attempt.tried.push(format!("{name} from the agent")),
-                    Err(error) => attempt
-                        .tried
-                        .push(format!("{name} from the agent ({error})")),
-                }
-            }
-        }
-
-        Ok(None) => attempt
-            .tried
-            .push("no SSH agent (SSH_AUTH_SOCK is not set, and ~/.ssh/config names none)".to_owned()),
-
-        Err(error) => attempt.tried.push(format!("the SSH agent ({error})")),
+    if !attempt.accepted {
+        offer_key_files(connection, username, ssh, &mut attempt).await;
     }
 
+    Ok(attempt)
+}
+
+/// Every key the agent is holding, which is how anyone with a passphrase-protected key or a
+/// hardware token signs in without being asked for anything.
+async fn offer_agent_keys(
+    connection: &mut client::Handle<HostKeyCheck>,
+    username: &str,
+    ssh: &SshConfig,
+    attempt: &mut Attempt,
+) {
+    let mut agent = match agent(ssh).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            attempt.tried.push(
+                "no SSH agent (SSH_AUTH_SOCK is not set, and ~/.ssh/config names none)".to_owned(),
+            );
+
+            return;
+        }
+        Err(error) => {
+            attempt.tried.push(format!("the SSH agent ({error})"));
+
+            return;
+        }
+    };
+
+    let identities = agent.request_identities().await.unwrap_or_default();
+
+    if identities.is_empty() {
+        attempt.tried.push("the SSH agent, which is holding no keys".to_owned());
+    }
+
+    for identity in identities {
+        let (key, name) = named_key(identity);
+
+        let signed = connection
+            .authenticate_publickey_with(
+                username,
+                key,
+                Some(russh::keys::HashAlg::Sha256),
+                &mut agent,
+            )
+            .await;
+
+        match signed {
+            Ok(result) if result.success() => {
+                attempt.accepted = true;
+
+                return;
+            }
+            Ok(_) => attempt.tried.push(format!("{name} from the agent")),
+            Err(error) => attempt.tried.push(format!("{name} from the agent ({error})")),
+        }
+    }
+}
+
+/// An agent holds public keys and certificates alike, and both name themselves by their comment.
+fn named_key(identity: russh::keys::agent::AgentIdentity) -> (russh::keys::PublicKey, String) {
+    match identity {
+        russh::keys::agent::AgentIdentity::PublicKey { key, comment } => (key, comment),
+        russh::keys::agent::AgentIdentity::Certificate { certificate, comment } => (
+            russh::keys::PublicKey::new(certificate.public_key().clone(), ""),
+            comment,
+        ),
+    }
+}
+
+/// The key files `~/.ssh/config` names, and the ones `ssh` would try without being told.
+async fn offer_key_files(
+    connection: &mut client::Handle<HostKeyCheck>,
+    username: &str,
+    ssh: &SshConfig,
+    attempt: &mut Attempt,
+) {
     for path in identities(ssh) {
         let shown = path.display().to_string();
 
         // A key that needs a passphrase cannot be used this way: there is nowhere to ask for
         // one, so it says which key it was and how to use it.
-        match russh::keys::load_secret_key(&path, None) {
-            Ok(key) => {
-                let signed = connection
-                    .authenticate_publickey(
-                        username,
-                        russh::keys::PrivateKeyWithHashAlg::new(
-                            std::sync::Arc::new(key),
-                            Some(russh::keys::HashAlg::Sha256),
-                        ),
-                    )
-                    .await;
+        let Ok(key) = russh::keys::load_secret_key(&path, None).inspect_err(|error| {
+            attempt.tried.push(format!(
+                "{shown} ({}) — choose \"Key file\" to be asked for its passphrase",
+                short(error)
+            ))
+        }) else {
+            continue;
+        };
 
-                match signed {
-                    Ok(result) if result.success() => {
-                        attempt.accepted = true;
+        let signed = connection
+            .authenticate_publickey(
+                username,
+                russh::keys::PrivateKeyWithHashAlg::new(
+                    std::sync::Arc::new(key),
+                    Some(russh::keys::HashAlg::Sha256),
+                ),
+            )
+            .await;
 
-                        return Ok(attempt);
-                    }
-                    Ok(_) => attempt.tried.push(shown),
-                    Err(error) => attempt.tried.push(format!("{shown} ({error})")),
-                }
+        match signed {
+            Ok(result) if result.success() => {
+                attempt.accepted = true;
+
+                return;
             }
-            Err(error) => attempt
-                .tried
-                .push(format!("{shown} ({}) — choose \"Key file\" to be asked for its passphrase", short(&error))),
+            Ok(_) => attempt.tried.push(shown),
+            Err(error) => attempt.tried.push(format!("{shown} ({error})")),
         }
     }
-
-    Ok(attempt)
 }
 
 /// What signing in tried, so that failing can say so.
@@ -562,5 +589,61 @@ fn translate(error: russh_sftp::client::error::Error, path: &RemotePath) -> Erro
             _ => Error::provider(status.error_message),
         },
         error => Error::caused_by(format!("{path} could not be reached"), error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ssh` writes a non-standard port in brackets. A key trusted from a terminal has to be
+    /// found under the same name here, or Camion asks again about a host that is already
+    /// trusted — and writes a second entry when the answer is yes.
+    #[test]
+    fn a_non_standard_port_is_written_the_way_known_hosts_writes_it() {
+        assert_eq!(known_hosts_host("shire", 22), "shire");
+        assert_eq!(known_hosts_host("shire", 2222), "[shire]:2222");
+    }
+
+    #[test]
+    fn a_leading_tilde_becomes_the_home_directory() {
+        // SAFETY: the tests in this module are the only readers of HOME.
+        unsafe { std::env::set_var("HOME", "/home/camion") };
+
+        assert_eq!(expand_home("~/.ssh/id_ed25519"), "/home/camion/.ssh/id_ed25519");
+        assert_eq!(expand_home("/etc/keys/id_ed25519"), "/etc/keys/id_ed25519");
+
+        // Only the leading one: a file really called `~` in a directory is not a home.
+        assert_eq!(expand_home("keys/~/id_ed25519"), "keys/~/id_ed25519");
+    }
+
+    /// The UI greys out and phrases things from these, so a missing file arriving as a generic
+    /// provider failure would read as "something went wrong" for a file that is simply not there.
+    #[test]
+    fn sftp_statuses_become_the_domains_own_errors() {
+        use russh_sftp::protocol::{Status, StatusCode};
+
+        let path = RemotePath::parse("/reports/q3.txt").unwrap();
+        let status = |code| {
+            russh_sftp::client::error::Error::Status(Status {
+                id: 1,
+                status_code: code,
+                error_message: "no".to_owned(),
+                language_tag: String::new(),
+            })
+        };
+
+        assert!(matches!(
+            translate(status(StatusCode::NoSuchFile), &path),
+            Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            translate(status(StatusCode::PermissionDenied), &path),
+            Error::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            translate(status(StatusCode::Failure), &path),
+            Error::Provider { .. }
+        ));
     }
 }

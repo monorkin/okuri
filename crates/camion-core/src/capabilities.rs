@@ -64,6 +64,12 @@ pub struct Capabilities {
     pub empty_folders: Support,
     pub resume_uploads: bool,
     pub max_upload_size: Option<u64>,
+    /// How many transfers this kind of destination will take at once.
+    ///
+    /// Stated rather than inferred from the other flags: eight parallel uploads is polite to an
+    /// object store and rude to a small FTP server, and nothing else here can tell the two
+    /// apart.
+    pub transfer_slots: usize,
 }
 
 impl Capabilities {
@@ -76,6 +82,7 @@ impl Capabilities {
             empty_folders: Support::Native,
             resume_uploads: true,
             max_upload_size: None,
+            transfer_slots: 4,
         }
     }
 
@@ -88,15 +95,22 @@ impl Capabilities {
             empty_folders: Support::Emulated,
             resume_uploads: false,
             max_upload_size: None,
+            transfer_slots: 8,
         }
     }
 
+    /// Every operation is named rather than caught by a fallback, so adding one to
+    /// [`Operation`] is a compile error here instead of a silent claim of full support.
     pub fn supports(&self, operation: Operation) -> Support {
         match operation {
             Operation::Rename => self.rename,
             Operation::CreateFolder => self.create_folder,
             Operation::SetPermissions => self.permissions,
-            _ => Support::Native,
+            Operation::List
+            | Operation::Stat
+            | Operation::Read
+            | Operation::Write
+            | Operation::Delete => Support::Native,
         }
     }
 }

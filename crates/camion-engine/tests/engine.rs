@@ -110,14 +110,12 @@ fn creating_a_folder_shows_it_without_asking_again() {
 
     engine.send(Command::CreateFolder { session, name: "uploads".to_owned() });
 
-    let names = watcher.wait_for(|event| match event {
-        Event::Listing { entries, .. } if entries.iter().any(|entry| entry.name == "uploads") => {
-            Some(entries.into_iter().map(|entry| entry.name).collect::<Vec<_>>())
-        }
-        _ => None,
-    });
+    // Waited for by path rather than by contents, so the assertion below is the thing being
+    // tested rather than a restatement of what was waited for.
+    let mut names = watcher.wait_for_listing("/");
+    names.sort();
 
-    assert!(names.contains(&"uploads".to_owned()));
+    assert_eq!(names, vec!["README.md", "documents", "photos", "uploads"]);
 }
 
 #[test]
@@ -246,6 +244,43 @@ fn a_downloaded_file_lands_on_disk() {
     );
 }
 
+/// Dragging a folder out means the folder, with everything under it — not a refusal, and not a
+/// flat pile of its files next to each other.
+#[test]
+fn a_downloaded_folder_arrives_with_its_tree_intact() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let (engine, watcher, session) = started();
+    watcher.wait_for_listing("/");
+
+    engine.send(Command::Download {
+        session,
+        names: vec!["documents".to_owned()],
+        into: directory.path().to_path_buf(),
+    });
+
+    // One transfer per file, and the folder holds two of them.
+    for _ in 0..2 {
+        let outcome = watcher.wait_for(|event| match event {
+            Event::TransferFinished { outcome, .. } => Some(outcome),
+            _ => None,
+        });
+
+        assert_eq!(outcome, Outcome::Done);
+    }
+
+    let here = directory.path().join("documents");
+
+    assert_eq!(
+        std::fs::read_to_string(here.join("notes.txt")).unwrap(),
+        "remember the milk"
+    );
+    assert_eq!(
+        std::fs::metadata(here.join("invoices/2026-08.pdf")).unwrap().len(),
+        4096
+    );
+}
+
 #[test]
 fn moving_a_file_into_a_folder_takes_it_out_of_this_one() {
     let (engine, watcher, session) = started();
@@ -290,7 +325,8 @@ fn a_folder_cannot_be_moved_into_itself() {
     assert!(message.contains("cannot be moved inside itself"), "{message}");
 }
 
-// Dragging a folder out means the folder, with what is in it — not a refusal, and not its
+/// Something picked up in one folder and dropped in another is still moved from where it was
+/// found, not from wherever the listing happens to be by the time the drop lands.
 #[test]
 fn files_can_be_moved_after_navigating_away_from_them() {
     let (engine, watcher, session) = started();
@@ -408,4 +444,39 @@ fn a_destination_that_needs_a_password_asks_for_one() {
         Event::ConnectionFailed { reason, .. } => Some(reason),
         _ => None,
     });
+}
+
+/// Cancelling has to reach the transfer itself. Removing the row and leaving the upload running
+/// would keep writing to the server with nothing on screen to say so.
+#[test]
+fn a_cancelled_transfer_stops_and_says_it_was_cancelled() {
+    let directory = tempfile::tempdir().unwrap();
+    let dropped = directory.path().join("endless.bin");
+
+    // A pipe with nothing on the far end, so the upload is still going when the cancel lands.
+    // A real file would race: a few megabytes into memory can finish before the next command
+    // is read, and then the test would be measuring who won rather than what cancelling does.
+    assert!(
+        std::process::Command::new("mkfifo").arg(&dropped).status().unwrap().success(),
+        "mkfifo"
+    );
+
+    let (engine, watcher, session) = started();
+    watcher.wait_for_listing("/");
+
+    engine.send(Command::Upload { session, into: RemotePath::root(), sources: vec![dropped] });
+
+    let queued = watcher.wait_for(|event| match event {
+        Event::TransferAdded(transfer) => Some(transfer),
+        _ => None,
+    });
+
+    engine.send(Command::CancelTransfer(queued.id));
+
+    let outcome = watcher.wait_for(|event| match event {
+        Event::TransferFinished { outcome, .. } => Some(outcome),
+        _ => None,
+    });
+
+    assert_eq!(outcome, Outcome::Cancelled);
 }

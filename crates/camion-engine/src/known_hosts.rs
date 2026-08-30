@@ -35,8 +35,18 @@ impl KnownHosts {
         Some(Path::new(&std::env::var_os("HOME")?).join(".ssh/known_hosts"))
     }
 
-    pub fn verdict(&self, key: &HostKey) -> Verdict {
-        let contents = std::fs::read_to_string(&self.path).unwrap_or_default();
+    /// What `known_hosts` says about this key.
+    ///
+    /// A file that is not there yet and a file that cannot be read are told apart: the first is
+    /// every fresh account, and the second means the answer below is not to be trusted — every
+    /// host would look unknown, and answering the prompt would append to a file we cannot read.
+    pub fn verdict(&self, key: &HostKey) -> std::io::Result<Verdict> {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+
         let host = host_pattern(&key.host, key.port);
 
         let keys_on_file = contents
@@ -47,11 +57,11 @@ impl KnownHosts {
             .collect::<Vec<_>>();
 
         if keys_on_file.is_empty() {
-            Verdict::Unknown
+            Ok(Verdict::Unknown)
         } else if keys_on_file.contains(&key.public_key) {
-            Verdict::Known
+            Ok(Verdict::Known)
         } else {
-            Verdict::Changed
+            Ok(Verdict::Changed)
         }
     }
 
@@ -172,29 +182,29 @@ mod tests {
         let (_directory, known_hosts) =
             known_hosts_with(&format!("example.com {ED25519}\n"));
 
-        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)).unwrap(), Verdict::Known);
     }
 
     #[test]
     fn an_unlisted_host_is_unknown() {
         let (_directory, known_hosts) = known_hosts_with(&format!("example.com {ED25519}\n"));
 
-        assert_eq!(known_hosts.verdict(&key("elsewhere.com", 22, ED25519)), Verdict::Unknown);
+        assert_eq!(known_hosts.verdict(&key("elsewhere.com", 22, ED25519)).unwrap(), Verdict::Unknown);
     }
 
     #[test]
     fn a_different_key_for_a_known_host_is_a_change_not_a_new_host() {
         let (_directory, known_hosts) = known_hosts_with(&format!("example.com {ED25519}\n"));
 
-        assert_eq!(known_hosts.verdict(&key("example.com", 22, OTHER)), Verdict::Changed);
+        assert_eq!(known_hosts.verdict(&key("example.com", 22, OTHER)).unwrap(), Verdict::Changed);
     }
 
     #[test]
     fn a_non_standard_port_is_bracketed_the_way_openssh_writes_it() {
         let (_directory, known_hosts) = known_hosts_with(&format!("[example.com]:2222 {ED25519}\n"));
 
-        assert_eq!(known_hosts.verdict(&key("example.com", 2222, ED25519)), Verdict::Known);
-        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)), Verdict::Unknown);
+        assert_eq!(known_hosts.verdict(&key("example.com", 2222, ED25519)).unwrap(), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)).unwrap(), Verdict::Unknown);
     }
 
     #[test]
@@ -202,7 +212,7 @@ mod tests {
         let (_directory, known_hosts) =
             known_hosts_with(&format!("example.com,203.0.113.7 {ED25519}\n"));
 
-        assert_eq!(known_hosts.verdict(&key("203.0.113.7", 22, ED25519)), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key("203.0.113.7", 22, ED25519)).unwrap(), Verdict::Known);
     }
 
     #[test]
@@ -219,8 +229,8 @@ mod tests {
 
         let (_directory, known_hosts) = known_hosts_with(&line);
 
-        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)), Verdict::Known);
-        assert_eq!(known_hosts.verdict(&key("elsewhere.com", 22, ED25519)), Verdict::Unknown);
+        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)).unwrap(), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key("elsewhere.com", 22, ED25519)).unwrap(), Verdict::Unknown);
     }
 
     #[test]
@@ -229,7 +239,7 @@ mod tests {
             "# a comment\n\n@revoked example.com {ED25519}\n@cert-authority example.com {ED25519}\n"
         ));
 
-        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)), Verdict::Unknown);
+        assert_eq!(known_hosts.verdict(&key("example.com", 22, ED25519)).unwrap(), Verdict::Unknown);
     }
 
     #[test]
@@ -239,9 +249,9 @@ mod tests {
 
         known_hosts.remember(&key).unwrap();
 
-        assert_eq!(known_hosts.verdict(&key), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key).unwrap(), Verdict::Known);
         assert_eq!(
-            known_hosts.verdict(&self::key("elsewhere.com", 22, "ssh-rsa AAAA")),
+            known_hosts.verdict(&self::key("elsewhere.com", 22, "ssh-rsa AAAA")).unwrap(),
             Verdict::Known
         );
     }
@@ -252,9 +262,9 @@ mod tests {
         let known_hosts = KnownHosts::new(directory.path().join("nothing/known_hosts"));
         let key = key("example.com", 22, ED25519);
 
-        assert_eq!(known_hosts.verdict(&key), Verdict::Unknown);
+        assert_eq!(known_hosts.verdict(&key).unwrap(), Verdict::Unknown);
 
         known_hosts.remember(&key).unwrap();
-        assert_eq!(known_hosts.verdict(&key), Verdict::Known);
+        assert_eq!(known_hosts.verdict(&key).unwrap(), Verdict::Known);
     }
 }

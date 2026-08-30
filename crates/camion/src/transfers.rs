@@ -117,17 +117,17 @@ impl cxx_qt::Initialize for qobject::Transfers {
             Event::TransferAdded(transfer) => {
                 let transfer = transfer.clone();
 
-                let _ = thread.queue(move |model| model.add(transfer));
+                crate::qt::queue(&thread, move |model| model.add(transfer));
             }
             Event::TransferProgress { transfer, transferred } => {
                 let (id, transferred) = (*transfer, *transferred);
 
-                let _ = thread.queue(move |model| model.advance(id, transferred));
+                crate::qt::queue(&thread, move |model| model.advance(id, transferred));
             }
             Event::TransferFinished { transfer, outcome } => {
                 let (id, outcome) = (*transfer, outcome.clone());
 
-                let _ = thread.queue(move |model| model.finish(id, outcome));
+                crate::qt::queue(&thread, move |model| model.finish(id, outcome));
             }
             _ => {}
         });
@@ -183,9 +183,9 @@ impl qobject::Transfers {
     }
 
     pub fn id_at(&self, row: i32) -> i64 {
-        self.rust()
-            .queue
-            .get(row.max(0) as usize)
+        usize::try_from(row)
+            .ok()
+            .and_then(|row| self.rust().queue.get(row))
             .map(|transfer| transfer.id.0 as i64)
             .unwrap_or(-1)
     }

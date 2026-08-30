@@ -39,12 +39,14 @@ FocusScope {
 
         App.beginMove(selectedNames())
 
-        // Setting this is what starts the drag: with an automatic drag Qt hands the data to
-        // the desktop here and blocks until it is dropped or abandoned, then clears the flag
-        // itself. `startDrag()` is for a drag that is already going, which this is not.
+        // Setting this is what starts the drag. `startDrag()` is for a drag that is already
+        // going, which this is not.
+        //
+        // It does not block: the compositor takes the gesture and this returns straight away,
+        // long before anything has been dropped. What is being carried is therefore cleared
+        // when the drag ends rather than here — clearing it here throws it away while the drag
+        // is still in flight, and every drop then lands carrying nothing.
         dragSource.Drag.active = true
-
-        App.endMove()
     }
 
     /// What carries the drag, and what it offers.
@@ -66,6 +68,9 @@ FocusScope {
         // What the pointer carries while dragging. Without one the desktop is given this
         // item, which is a single pixel and looks like nothing at all.
         Drag.imageSource: browser.files.iconAt(selection.current)
+        // Qt clears this when the drag finishes, which is after any drop has been delivered.
+        Drag.onActiveChanged: if (!dragSource.Drag.active) App.endMove()
+
         Drag.mimeData: App.dragUrls.length > 0
             ? ({
                 "application/x-camion-move": App.moving.join("\n"),

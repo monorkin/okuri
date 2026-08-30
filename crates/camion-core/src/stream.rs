@@ -82,10 +82,13 @@ impl ByteRange {
     }
 
     /// The `bytes=0-1023` form that HTTP-shaped providers want.
+    ///
+    /// A range of no bytes has no last byte to name, so it is written open-ended rather than
+    /// as `bytes=0-18446744073709551615`, which is what subtracting one from nothing gives.
     pub fn to_header(&self) -> String {
         match self.length {
+            Some(0) | None => format!("bytes={}-", self.offset),
             Some(length) => format!("bytes={}-{}", self.offset, self.offset + length - 1),
-            None => format!("bytes={}-", self.offset),
         }
     }
 }
@@ -98,6 +101,9 @@ mod tests {
     fn ranges_render_as_http_headers() {
         assert_eq!(ByteRange::from(512).to_header(), "bytes=512-");
         assert_eq!(ByteRange::new(0, 1024).to_header(), "bytes=0-1023");
+
+        // No bytes has no last byte to name.
+        assert_eq!(ByteRange::new(0, 0).to_header(), "bytes=0-");
     }
 
     #[tokio::test]

@@ -22,6 +22,12 @@ impl Color {
     pub fn parse(input: &str) -> Option<Self> {
         let digits = input.trim().trim_start_matches('#');
 
+        // Counted and sliced in bytes below, which only lines up with characters while every
+        // one of them is ASCII — and a hex digit always is.
+        if !digits.is_ascii() {
+            return None;
+        }
+
         let expand = |digit: &str| u8::from_str_radix(&digit.repeat(2), 16).ok();
         let byte = |at: usize| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok();
 
@@ -71,6 +77,15 @@ impl fmt::Display for Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_colour_that_is_not_hex_is_not_a_colour() {
+        assert_eq!(Color::parse("#nope"), None);
+        assert_eq!(Color::parse(""), None);
+
+        // Three bytes, but not three characters — slicing this one apart used to panic.
+        assert_eq!(Color::parse("#é1"), None);
+    }
 
     #[test]
     fn hex_is_parsed_in_every_length_themes_use() {

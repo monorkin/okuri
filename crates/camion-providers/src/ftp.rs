@@ -28,7 +28,7 @@ pub struct FtpProvider {
 
 impl FtpProvider {
     fn at(&self, path: &RemotePath) -> String {
-        at(&self.home, path)
+        crate::keys::under(&self.home, path)
     }
 
     pub async fn connect(config: &FtpConfig, secret: &Secret) -> Result<Self> {
@@ -165,9 +165,11 @@ impl Provider for FtpProvider {
         let bytes = match range {
             None => bytes,
             Some(range) => {
-                let start = (range.offset as usize).min(bytes.len());
+                let start = usize::try_from(range.offset).unwrap_or(usize::MAX).min(bytes.len());
                 let end = match range.length {
-                    Some(length) => (start + length as usize).min(bytes.len()),
+                    Some(length) => start.saturating_add(
+                        usize::try_from(length).unwrap_or(usize::MAX),
+                    ).min(bytes.len()),
                     None => bytes.len(),
                 };
 
@@ -250,19 +252,6 @@ fn encryption() -> Result<AsyncRustlsConnector> {
 
 
 
-/// Turns a path the interface is holding into one the server understands, by hanging it off
-/// the directory this connection calls its root.
-fn at(home: &str, path: &RemotePath) -> String {
-    if path.is_root() {
-        match home.is_empty() {
-            true => "/".to_owned(),
-            false => home.to_owned(),
-        }
-    } else {
-        format!("{home}/{}", path.to_key())
-    }
-}
-
 fn describe(listed: &Listed) -> Entry {
     let mut entry = match listed.is_directory() {
         true => Entry::folder(listed.name()),
@@ -312,20 +301,11 @@ mod tests {
         assert!(describe(&folder).kind.is_folder());
     }
 
-    /// Logging in does not necessarily put you at the root of anything, and on a server that
-    /// is not chrooted an absolute path would leave the account's own directory entirely.
     #[test]
-    fn paths_hang_off_the_login_directory() {
-        assert_eq!(at("/home/camion", &RemotePath::root()), "/home/camion");
-        assert_eq!(
-            at("/home/camion", &RemotePath::parse("/reports/q3.txt").unwrap()),
-            "/home/camion/reports/q3.txt"
-        );
-    }
+    fn a_unix_listing_line_with_a_space_in_the_name_keeps_it() {
+        let file =
+            Listed::from_str("-rw-r--r-- 1 camion camion 12 Aug 26 10:00 last summer.jpg").unwrap();
 
-    #[test]
-    fn a_server_that_lands_you_at_the_root_is_addressed_from_there() {
-        assert_eq!(at("", &RemotePath::root()), "/");
-        assert_eq!(at("", &RemotePath::parse("/reports").unwrap()), "/reports");
+        assert_eq!(describe(&file).name, "last summer.jpg");
     }
 }

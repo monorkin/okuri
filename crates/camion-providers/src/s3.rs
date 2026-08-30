@@ -7,7 +7,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream as AwsStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use camion_core::{
     ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
 };
@@ -15,6 +15,7 @@ use futures::StreamExt;
 use time::OffsetDateTime;
 
 use crate::destination::S3 as S3Config;
+use crate::keys::{last_segment, normalize_root, rebase};
 use crate::secret::Secret;
 
 /// Anything that speaks S3: Amazon, Cloudflare R2, Backblaze B2, MinIO, and the rest.
@@ -30,8 +31,10 @@ pub struct S3Provider {
     client: Client,
 }
 
-/// Anything smaller goes up in one request; anything larger is split into parts. Five megabytes
-/// is the smallest part S3 accepts for all but the last one.
+/// Anything smaller goes up in one request; anything larger is split into parts of this size.
+///
+/// Comfortably above the five megabytes S3 requires of every part but the last, so a file just
+/// over the threshold still splits into parts the service will accept.
 const PART_SIZE: usize = 8 * 1024 * 1024;
 
 /// The zero-byte object whose key ends in `/`, which is how every S3 client agrees to write
@@ -127,12 +130,18 @@ impl S3Provider {
         for batch in keys.chunks(1000) {
             let objects = batch
                 .iter()
-                .filter_map(|key| ObjectIdentifier::builder().key(key).build().ok())
-                .collect::<Vec<_>>();
+                .map(|key| {
+                    ObjectIdentifier::builder()
+                        .key(key)
+                        .build()
+                        .map_err(|error| failed(format!("could not name {key}"), error))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            let Ok(delete) = Delete::builder().set_objects(Some(objects)).build() else {
-                continue;
-            };
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .map_err(|error| failed("could not list what to delete", error))?;
 
             self.client
                 .delete_objects()
@@ -161,37 +170,25 @@ impl S3Provider {
         };
 
         let mut parts = Vec::new();
-        let mut buffer = BytesMut::with_capacity(PART_SIZE);
-        let mut finished = false;
 
-        while !finished {
-            match body.next().await {
-                Some(chunk) => buffer.extend_from_slice(&chunk?),
-                None => finished = true,
-            }
+        while let Some(bytes) = crate::parts::next_part(&mut body, PART_SIZE).await? {
+            let number = parts.len() as i32 + 1;
 
-            // The last part is allowed to be small; every other one has to reach the minimum,
-            // so a part is only sent once there is enough for one or the bytes have run out.
-            if buffer.len() >= PART_SIZE || (finished && !buffer.is_empty()) {
-                let number = parts.len() as i32 + 1;
-                let part = self.upload_part(key, upload_id, number, buffer.split().freeze()).await;
+            match self.upload_part(key, upload_id, number, bytes.into()).await {
+                Ok(part) => parts.push(part),
+                Err(error) => {
+                    // Leaving the parts behind would quietly cost money for as long as the
+                    // bucket lives, so a failed upload cleans up after itself.
+                    let _ = self
+                        .client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send()
+                        .await;
 
-                match part {
-                    Ok(part) => parts.push(part),
-                    Err(error) => {
-                        // Leaving the parts behind would quietly cost money for as long as the
-                        // bucket lives, so a failed upload cleans up after itself.
-                        let _ = self
-                            .client
-                            .abort_multipart_upload()
-                            .bucket(&self.bucket)
-                            .key(key)
-                            .upload_id(upload_id)
-                            .send()
-                            .await;
-
-                        return Err(error);
-                    }
+                    return Err(error);
                 }
             }
         }
@@ -355,7 +352,7 @@ impl Provider for S3Provider {
             .set_range(range.map(|range| range.to_header()))
             .send()
             .await
-            .map_err(|_| Error::NotFound { path: path.clone() })?;
+            .map_err(|error| missing_or_refused(error, path))?;
 
         let size = object.content_length().map(|length| length as u64);
         let chunks = tokio_util::io::ReaderStream::new(object.body.into_async_read()).map(|chunk| {
@@ -371,7 +368,7 @@ impl Provider for S3Provider {
         // A small file is one request; anything bigger is split, so a large upload never has to
         // be held in memory all at once.
         match body.size() {
-            Some(size) if (size as usize) <= PART_SIZE => {
+            Some(size) if size <= PART_SIZE as u64 => {
                 let bytes = body.collect().await?;
 
                 self.client
@@ -448,14 +445,14 @@ impl Provider for S3Provider {
 
         for key in &moved {
             let renamed = match entry.kind.is_folder() {
-                true => format!("{destination}{}", key.trim_start_matches(&source)),
+                true => rebase(key, &source, &destination),
                 false => self.key(to),
             };
 
             self.client
                 .copy_object()
                 .bucket(&self.bucket)
-                .copy_source(format!("{}/{key}", self.bucket))
+                .copy_source(encoded_source(&self.bucket, key))
                 .key(renamed)
                 .send()
                 .await
@@ -466,27 +463,43 @@ impl Provider for S3Provider {
     }
 }
 
-/// The part of `key` that comes after `prefix` and before the next separator, which is the name
-/// the file list shows.
-fn last_segment(key: &str, prefix: &str) -> Option<String> {
-    let name = key.strip_prefix(prefix)?.trim_end_matches('/');
+/// The `bucket/key` a copy reads from, with the characters a URL cannot carry escaped. A key
+/// is free to contain a space or a `#`; a copy source is a URL and is not.
+fn encoded_source(bucket: &str, key: &str) -> String {
+    /// Everything but the characters a URL may carry as they are.
+    const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
 
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_owned())
-    }
+    let escaped = key
+        .split('/')
+        .map(|segment| percent_encoding::utf8_percent_encode(segment, RESERVED).to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    format!("{bucket}/{escaped}")
 }
 
-/// A connection can be pointed at one folder of a shared bucket rather than the whole thing, so
-/// the root is stored the way keys are built: no leading slash, one trailing slash.
-fn normalize_root(root: &str) -> String {
-    let root = root.trim_matches('/');
+/// Whether the object is absent, or something else went wrong.
+///
+/// Reporting a refused key or a dropped connection as "does not exist" is worse than unhelpful:
+/// [`Error::NotFound`] is not transient, so the transfer queue will not retry what may only
+/// have been a blip.
+fn missing_or_refused<E>(error: E, path: &RemotePath) -> Error
+where
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    let absent = matches!(
+        error.code(),
+        Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "404")
+    );
 
-    if root.is_empty() {
-        String::new()
+    if absent {
+        Error::NotFound { path: path.clone() }
     } else {
-        format!("{root}/")
+        failed(format!("{path} could not be read"), error)
     }
 }
 
@@ -503,18 +516,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_root_prefix_is_stored_the_way_keys_are_built() {
-        assert_eq!(normalize_root(""), "");
-        assert_eq!(normalize_root("/"), "");
-        assert_eq!(normalize_root("site"), "site/");
-        assert_eq!(normalize_root("/site/assets/"), "site/assets/");
-    }
-
-    #[test]
-    fn names_are_what_is_left_after_the_prefix() {
-        assert_eq!(last_segment("photos/2026/", "photos/"), Some("2026".to_owned()));
-        assert_eq!(last_segment("photos/a.jpg", "photos/"), Some("a.jpg".to_owned()));
-        assert_eq!(last_segment("photos/", "photos/"), None);
-        assert_eq!(last_segment("elsewhere/a.jpg", "photos/"), None);
+    fn a_copy_source_escapes_what_a_url_cannot_carry() {
+        assert_eq!(
+            encoded_source("assets", "photos/last summer.jpg"),
+            "assets/photos/last%20summer.jpg"
+        );
+        assert_eq!(encoded_source("assets", "a#b/c+d"), "assets/a%23b/c%2Bd");
     }
 }

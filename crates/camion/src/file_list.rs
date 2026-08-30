@@ -158,10 +158,41 @@ impl Arriving {
     }
 }
 
+/// One line of the list, with everything it draws worked out already.
+///
+/// `data` is called once per column per repaint, so the columns are written when the listing
+/// is built rather than re-derived every time the view scrolls past them.
 struct Row {
     entry: Entry,
     icon: String,
+    size: String,
+    modified: String,
+    permissions: String,
+    kind: &'static str,
     fraction: Option<f64>,
+}
+
+impl Row {
+    fn new(icon: String, fraction: Option<f64>, now: time::OffsetDateTime, entry: Entry) -> Self {
+        Self {
+            icon,
+            size: match entry.kind.is_folder() {
+                true => String::new(),
+                false => format::size(entry.size),
+            },
+            modified: match entry.modified {
+                Some(modified) => format::modified(format::local(modified), now),
+                None => String::new(),
+            },
+            permissions: match entry.permissions {
+                Some(permissions) => permissions.to_symbolic(),
+                None => String::new(),
+            },
+            kind: crate::kinds::of(&entry.name, entry.kind.is_folder()).label,
+            fraction,
+            entry,
+        }
+    }
 }
 
 impl Default for FileListRust {
@@ -189,15 +220,15 @@ impl cxx_qt::Initialize for qobject::FileList {
                 let path = path.clone();
                 let entries = entries.clone();
 
-                let _ = thread.queue(move |model| model.replace(path, entries));
+                crate::qt::queue(&thread, move |model| model.replace(path, entries));
             }
             Event::Working { working, .. } => {
                 let working = *working;
 
-                let _ = thread.queue(move |mut model| model.as_mut().set_working(working));
+                crate::qt::queue(&thread, move |mut model| model.as_mut().set_working(working));
             }
             Event::Disconnected { .. } => {
-                let _ = thread.queue(|model| model.replace(RemotePath::root(), Vec::new()));
+                crate::qt::queue(&thread, |model| model.replace(RemotePath::root(), Vec::new()));
             }
 
             // A file that has been dropped belongs on screen immediately, filling as it goes.
@@ -219,19 +250,19 @@ impl cxx_qt::Initialize for qobject::FileList {
                     landed: false,
                 };
 
-                let _ = thread.queue(move |model| model.expect(arriving));
+                crate::qt::queue(&thread, move |model| model.expect(arriving));
             }
 
             Event::TransferProgress { transfer, transferred } => {
                 let (id, transferred) = (*transfer, *transferred);
 
-                let _ = thread.queue(move |model| model.advance(id, transferred));
+                crate::qt::queue(&thread, move |model| model.advance(id, transferred));
             }
 
             Event::TransferFinished { transfer, .. } => {
                 let id = *transfer;
 
-                let _ = thread.queue(move |model| model.arrived(id));
+                crate::qt::queue(&thread, move |model| model.arrived(id));
             }
 
             _ => {}
@@ -242,14 +273,14 @@ impl cxx_qt::Initialize for qobject::FileList {
         let thread = self.qt_thread();
 
         crate::desktop::on_theme_change(move || {
-            let _ = thread.queue(|model| model.reload_icons());
+            crate::qt::queue(&thread, |model| model.reload_icons());
         });
 
         // Sorting and hidden files are display settings, held once and read from here.
         let thread = self.qt_thread();
 
         crate::view::on_change(move || {
-            let _ = thread.queue(|model| model.rebuild());
+            crate::qt::queue(&thread, |model| model.rebuild());
         });
     }
 }
@@ -264,20 +295,11 @@ impl qobject::FileList {
 
         match role {
             NAME => text(row.entry.name.clone()),
-            SIZE => text(match row.entry.kind.is_folder() {
-                true => String::new(),
-                false => format::size(row.entry.size),
-            }),
-            MODIFIED => text(match row.entry.modified {
-                Some(modified) => format::modified(modified, time::OffsetDateTime::now_utc()),
-                None => String::new(),
-            }),
+            SIZE => text(row.size.clone()),
+            MODIFIED => text(row.modified.clone()),
             IS_FOLDER => QVariant::from(&row.entry.kind.is_folder()),
-            PERMISSIONS => text(match row.entry.permissions {
-                Some(permissions) => permissions.to_symbolic(),
-                None => String::new(),
-            }),
-            KIND => text(format::kind(&row.entry.name, row.entry.kind.is_folder()).to_owned()),
+            PERMISSIONS => text(row.permissions.clone()),
+            KIND => text(row.kind.to_owned()),
             ICON => text(row.icon.clone()),
             UPLOADING => QVariant::from(&row.fraction.is_some()),
             FRACTION => QVariant::from(&row.fraction.unwrap_or_default()),
@@ -318,7 +340,8 @@ impl qobject::FileList {
             .iter()
             .map(|row| row.entry.name.to_lowercase())
             .collect::<Vec<_>>();
-        let start = (after + 1).max(0) as usize;
+        // `-1` means "start from the top", which is what the first keystroke of a search sends.
+        let start = usize::try_from(after + 1).unwrap_or(0);
 
         // Wraps around, so holding down a letter cycles through everything starting with it.
         (start..names.len())
@@ -330,31 +353,24 @@ impl qobject::FileList {
 
     pub fn name_at(&self, row: i32) -> QString {
         QString::from(
-            &self
-                .rust()
-                .rows
-                .get(row.max(0) as usize)
-                .map(|row| row.entry.name.clone())
-                .unwrap_or_default(),
+            &self.at(row).map(|row| row.entry.name.clone()).unwrap_or_default(),
         )
     }
 
     pub fn icon_at(&self, row: i32) -> QString {
-        QString::from(
-            &self
-                .rust()
-                .rows
-                .get(row.max(0) as usize)
-                .map(|row| row.icon.clone())
-                .unwrap_or_default(),
-        )
+        QString::from(&self.at(row).map(|row| row.icon.clone()).unwrap_or_default())
     }
 
     pub fn is_folder_at(&self, row: i32) -> bool {
-        self.rust()
-            .rows
-            .get(row.max(0) as usize)
-            .is_some_and(|row| row.entry.kind.is_folder())
+        self.at(row).is_some_and(|row| row.entry.kind.is_folder())
+    }
+
+    /// The row at `row`, if there is one.
+    ///
+    /// QML says "nothing is selected" with `-1`, and clamping that to zero would quietly answer
+    /// every question about the selection with the first file in the list.
+    fn at(&self, row: i32) -> Option<&Row> {
+        self.rust().rows.get(usize::try_from(row).ok()?)
     }
 
     /// Re-reads the desktop's icon theme and redraws with it.
@@ -500,6 +516,10 @@ fn merge(
     let mut entries = entries.to_vec();
     sort.apply(&mut entries);
 
+    // One clock reading for the whole listing, so two files saved a second apart do not end up
+    // described relative to different "now"s.
+    let now = format::now();
+
     let landing_here = |name: &str| {
         arriving
             .iter()
@@ -509,10 +529,13 @@ fn merge(
     let mut rows = entries
         .into_iter()
         .filter(|entry| showing_hidden || !entry.is_hidden())
-        .map(|entry| Row {
-            icon: icons.for_file(&entry.name, entry.kind.is_folder()),
-            fraction: landing_here(&entry.name).and_then(Arriving::fraction),
-            entry,
+        .map(|entry| {
+            Row::new(
+                icons.for_file(&entry.name, entry.kind.is_folder()),
+                landing_here(&entry.name).and_then(Arriving::fraction),
+                now,
+                entry,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -525,11 +548,12 @@ fn merge(
             continue;
         }
 
-        rows.push(Row {
-            entry: Entry::file(&arriving.name, arriving.total.unwrap_or_default()),
-            icon: icons.for_file(&arriving.name, false),
-            fraction: arriving.fraction(),
-        });
+        rows.push(Row::new(
+            icons.for_file(&arriving.name, false),
+            arriving.fraction(),
+            now,
+            Entry::file(&arriving.name, arriving.total.unwrap_or_default()),
+        ));
     }
 
     rows
@@ -557,7 +581,7 @@ mod tests {
             &RemotePath::parse(here).unwrap(),
             false,
             Sort::by_name(),
-            &crate::icons::Icons { themes: Vec::new(), resolved: Default::default() },
+            &crate::icons::Icons::in_themes(Vec::new()),
         )
     }
 

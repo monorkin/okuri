@@ -74,6 +74,9 @@ impl SecretStore for Keyring {
 /// anything running as you could read it just as easily as we can.
 pub struct EncryptedFile {
     path: PathBuf,
+    /// Held rather than read back each time: it is the salt this store's key was derived from,
+    /// so a different one off disk could only ever produce a file we can no longer open.
+    salt: Vec<u8>,
     key: chacha20poly1305::Key,
     secrets: Mutex<BTreeMap<String, Secret>>,
 }
@@ -92,36 +95,37 @@ impl EncryptedFile {
     pub fn open(path: impl Into<PathBuf>, passphrase: &str) -> Result<Self> {
         let path = path.into();
 
-        let (salt, secrets) = match std::fs::read(&path) {
+        let (salt, key, secrets) = match std::fs::read(&path) {
             Ok(contents) => {
                 let (salt, sealed) = split(&contents)?;
                 let key = derive(passphrase, &salt)?;
+                let secrets = unseal(&key, sealed)?;
 
-                (salt, unseal(&key, sealed)?)
+                (salt, key, secrets)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut salt = [0u8; SALT_LEN];
                 rand::thread_rng().fill_bytes(&mut salt);
 
-                (salt.to_vec(), BTreeMap::new())
+                // Deriving a key is deliberately slow, so it happens once here rather than
+                // once per branch and again on the way out.
+                let key = derive(passphrase, &salt)?;
+
+                (salt.to_vec(), key, BTreeMap::new())
             }
             Err(error) => {
                 return Err(Error::secrets(format!("could not read {}: {error}", path.display())));
             }
         };
 
-        let store = Self {
-            key: derive(passphrase, &salt)?,
-            path,
-            secrets: Mutex::new(secrets),
-        };
+        let store = Self { path, salt, key, secrets: Mutex::new(secrets) };
 
-        store.save(&salt)?;
+        store.save()?;
 
         Ok(store)
     }
 
-    fn save(&self, salt: &[u8]) -> Result<()> {
+    fn save(&self) -> Result<()> {
         let plaintext = serde_json::to_vec(&*self.secrets.lock().unwrap())
             .map_err(|error| Error::secrets(format!("could not encode the secrets: {error}")))?;
 
@@ -134,18 +138,11 @@ impl EncryptedFile {
 
         let mut contents = Vec::with_capacity(MAGIC.len() + SALT_LEN + NONCE_LEN + sealed.len());
         contents.extend_from_slice(MAGIC);
-        contents.extend_from_slice(salt);
+        contents.extend_from_slice(&self.salt);
         contents.extend_from_slice(&nonce);
         contents.extend_from_slice(&sealed);
 
         write_privately(&self.path, &contents)
-    }
-
-    fn salt(&self) -> Result<Vec<u8>> {
-        let contents = std::fs::read(&self.path)
-            .map_err(|error| Error::secrets(format!("could not reopen the secrets: {error}")))?;
-
-        Ok(split(&contents)?.0)
     }
 }
 
@@ -156,12 +153,12 @@ impl SecretStore for EncryptedFile {
 
     fn set(&self, id: &str, secret: &Secret) -> Result<()> {
         self.secrets.lock().unwrap().insert(id.to_owned(), secret.clone());
-        self.save(&self.salt()?)
+        self.save()
     }
 
     fn remove(&self, id: &str) -> Result<()> {
         self.secrets.lock().unwrap().remove(id);
-        self.save(&self.salt()?)
+        self.save()
     }
 }
 
