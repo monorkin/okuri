@@ -1,0 +1,49 @@
+# Maintainer: Stanko K.R. <stanko@stanko.io>
+# Template for the AUR -bin package. `make release-aur` fills in the
+# @PLACEHOLDER@ values and pushes the result to the AUR.
+pkgname=okuri-bin
+_binname=okuri
+pkgver=@PKGVER@
+pkgrel=@PKGREL@
+pkgdesc="Dead-simple file transfer for Omarchy & Linux (prebuilt binary)"
+arch=('x86_64')
+url="https://github.com/monorkin/okuri"
+license=('MIT')
+# A lower bound only. Qt keeps binary compatibility across Qt 6 minor releases, so the linking
+# side is safe; what this binary is really tied to is the compiled-QML data structure version,
+# which Qt bumps when that layout changes rather than on every release. An upper bound would
+# trade that occasional break for a certain one — the package refusing to install after every
+# Qt bump, broken or not. If a bump ever does break it, republish with a new pkgrel.
+depends=('glibc' 'gcc-libs'
+         "qt6-base>=@QT_SERIES@"
+         "qt6-declarative>=@QT_SERIES@")
+provides=('okuri')
+conflicts=('okuri')
+options=('!debug')
+# The icons are fetched from the tag rather than committed here. They are already at the sizes
+# hicolor wants, so nothing has to be resized and nothing has to be installed to do it.
+source=('LICENSE'
+        'okuri.desktop'
+        "$_binname-48-$pkgver.png::$url/raw/v$pkgver/assets/icons/$_binname-48.png"
+        "$_binname-64-$pkgver.png::$url/raw/v$pkgver/assets/icons/$_binname-64.png"
+        "$_binname-128-$pkgver.png::$url/raw/v$pkgver/assets/icons/$_binname-128.png"
+        "$_binname-256-$pkgver.png::$url/raw/v$pkgver/assets/icons/$_binname-256.png")
+source_x86_64=("$_binname-$pkgver::$url/releases/download/v$pkgver/$_binname-linux-amd64")
+sha256sums=('@LICENSE_SHA256@'
+            '@DESKTOP_SHA256@'
+            '@ICON_48_SHA256@'
+            '@ICON_64_SHA256@'
+            '@ICON_128_SHA256@'
+            '@ICON_256_SHA256@')
+sha256sums_x86_64=('@AMD64_SHA256@')
+
+package() {
+  install -Dm755 "$_binname-$pkgver" "$pkgdir/usr/bin/$_binname"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 okuri.desktop "$pkgdir/usr/share/applications/$_binname.desktop"
+
+  for size in 48 64 128 256; do
+    install -Dm644 "$_binname-$size-$pkgver.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/$_binname.png"
+  done
+}

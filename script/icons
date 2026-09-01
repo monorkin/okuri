@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+source script/lib
+
+# Regenerates assets/icons from assets/icon.png.
+#
+# The results are committed, so neither package needs ImageMagick to build. Run this whenever
+# the master icon changes, and commit what it writes.
+
+main() {
+  command -v magick >/dev/null || die "magick is required (pacman -S imagemagick)"
+  [ -f "$ICON_MASTER" ] || die "$ICON_MASTER is missing"
+
+  check_master
+
+  mkdir -p assets/icons
+
+  # -strip, and the excluded chunks, because ImageMagick otherwise writes the time of the run
+  # into the file. The same master would then produce a different checksum every time, which
+  # means a diff on every run and a pointless change to the sums the -bin package pins.
+  for size in $ICON_SIZES; do
+    local target="assets/icons/$BINARY-$size.png"
+    magick "$ICON_MASTER" \
+      -resize "${size}x${size}" \
+      -strip \
+      -define png:exclude-chunk=date,time,tEXt,iTXt \
+      "$target"
+    echo "  $target  ($(dimensions "$target"), $(bytes "$target") bytes)"
+  done
+
+  echo
+  echo "Generated from $ICON_MASTER ($(dimensions "$ICON_MASTER"))"
+}
+
+# A launcher gets the icon it asks for or one scaled from the nearest size, so an icon that is
+# not square is stretched rather than letterboxed, and one smaller than the largest size we
+# ship is scaled up. Both are worth saying out loud rather than shipping quietly.
+check_master() {
+  local width height largest
+  width=$(magick identify -format '%w' "$ICON_MASTER")
+  height=$(magick identify -format '%h' "$ICON_MASTER")
+  largest=$(echo "$ICON_SIZES" | tr ' ' '\n' | sort -n | tail -1)
+
+  if [ "$width" != "$height" ]; then
+    die "$ICON_MASTER is ${width}x${height}, which is not square — it would be stretched"
+  fi
+
+  if [ "$width" -lt "$largest" ]; then
+    die "$ICON_MASTER is ${width}px, smaller than the ${largest}px icon we ship"
+  fi
+}
+
+dimensions() {
+  magick identify -format '%wx%h' "$1"
+}
+
+bytes() {
+  stat -c%s "$1"
+}
+
+main "$@"

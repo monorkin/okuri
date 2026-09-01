@@ -1,0 +1,57 @@
+name: Release
+
+# Every tag that names a version gets a built binary attached to its release, which is where
+# `mise` looks for one: `ubi:monorkin/okuri` reads the release assets and picks the file whose
+# name carries the right platform.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built inside Arch rather than on the runner's Ubuntu, because the QML is compiled ahead
+      # of time by qmlcachegen and the result is only loadable by the Qt that produced it. A
+      # binary built against an older Qt starts and then fails to find its own windows.
+      - name: Build against Arch's Qt
+        run: |
+          docker run --rm \
+            --volume "$PWD":/okuri \
+            --workdir /okuri \
+            --env CARGO_TERM_COLOR=always \
+            archlinux:latest \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed \
+                base-devel rust qt6-base qt6-declarative
+              cargo build --release --locked --package okuri
+              chown -R '"$(id -u):$(id -g)"' target
+            '
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="okuri-${version}-x86_64-linux"
+
+          mkdir -p "dist/${name}"
+          cp target/release/okuri README.md LICENSE "dist/${name}/"
+
+          tar --create --gzip --directory dist --file "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.sha256 --clobber

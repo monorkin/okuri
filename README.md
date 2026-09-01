@@ -2,9 +2,7 @@
 
 Dead-simple file transfer for Omarchy & Linux.
 
-| | |
-|-|-|
-| <img width="440" height="367" alt="Okuri connected to a server" src="https://github.com/user-attachments/assets/f85287b3-cead-44a7-8b9b-d1a6b9939334" /> | <img width="440" height="366" alt="Okuri" src="https://github.com/user-attachments/assets/3be6409d-b5ce-4821-96a2-ccb36a5f1181" /> |
+![Okuri's icon](./assets/icon.png)
 
 Supports:
 - SFTP
@@ -19,10 +17,29 @@ Supports:
 
 **Omarchy:**
 ```bash
-omarchy mise install okuri
+omarchy pkg aur add okuri
+```
+
+**Arch:**
+```bash
+yay -S okuri-bin   # prebuilt, no compile
+# yay -S okuri       # builds from source
+```
+
+**Anything else:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/monorkin/okuri/main/install.sh | bash
 ```
 
 ## Features
+
+### Minimal UI
+
+Okuri's UI is intentionally clean and minimal
+
+| | |
+|-|-|
+| <img width="440" height="367" alt="Okuri connected to a server" src="https://github.com/user-attachments/assets/f85287b3-cead-44a7-8b9b-d1a6b9939334" /> | <img width="440" height="366" alt="Okuri" src="https://github.com/user-attachments/assets/3be6409d-b5ce-4821-96a2-ccb36a5f1181" /> |
 
 ### Drag and drop
 
@@ -61,7 +78,8 @@ Okuri has full theming support for Omarchy.
 
 ## For nerds
 
-Okuri is a native application built with Qt and Rust.
+Okuri is a native application built with Qt (with QML) and Rust.
+Qt 6 is dynamically linked, so you have to have it installed on your machine for Okuri to run.
 
 To run it locally:
 ```bash
@@ -76,4 +94,4 @@ cargo build --release -p okuri
 
 ## License
 
-Okuri is released under the MIT license. For more details read LICENSE
+Okuri is released under the MIT license. For more details read [LICENSE](./LICENSE)
