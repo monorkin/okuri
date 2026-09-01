@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use camion_core::{ByteStream, RemotePath};
@@ -117,21 +118,41 @@ impl Transfer {
     }
 }
 
-/// Wraps a stream so that every chunk passing through is counted.
+/// How often a running transfer is worth mentioning.
+///
+/// A progress bar cannot show more than a handful of states a second, and every report costs an
+/// event, a heap allocation, and a hop onto the interface thread. Reporting per chunk means
+/// millions of them for a large file — enough to hold up the transfer and to bury the window
+/// under redraws it gains nothing from.
+const REPORT_EVERY: Duration = Duration::from_millis(100);
+
+/// Wraps a stream so that the bytes passing through are counted.
 ///
 /// The progress bar is the only reason the engine cares how many bytes went by, so counting
 /// lives here rather than inside any provider.
+///
+/// The running total is exact; only how often it is mentioned is throttled. The last chunk
+/// always reports, so a finished transfer never stops short of its own size.
 pub fn counting(
     stream: ByteStream,
     mut report: impl FnMut(u64) + Send + 'static,
 ) -> ByteStream {
     let size = stream.size();
     let mut transferred = 0;
+    let mut mentioned = None::<Instant>;
 
     let counted = futures::StreamExt::map(stream, move |chunk| {
         if let Ok(bytes) = &chunk {
             transferred += bytes.len() as u64;
-            report(transferred);
+
+            let now = Instant::now();
+            let due = mentioned.is_none_or(|last| now.duration_since(last) >= REPORT_EVERY);
+            let whole = size.is_some_and(|size| transferred >= size);
+
+            if due || whole {
+                mentioned = Some(now);
+                report(transferred);
+            }
         }
 
         chunk
@@ -186,6 +207,30 @@ mod tests {
         let second = TransferId::next();
 
         assert_ne!(first, second);
+    }
+
+    /// A stream of many small chunks is one transfer, not one progress bar per chunk. Every
+    /// report costs an event and a hop onto the interface thread, and a bar cannot show more
+    /// than a few states a second anyway.
+    #[tokio::test]
+    async fn a_fast_stream_is_not_reported_on_chunk_by_chunk() {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&reported);
+
+        let chunks = (0..1000).map(|_| Ok(bytes::Bytes::from_static(b"camion")));
+        let stream = ByteStream::new(futures::stream::iter(chunks), Some(6000));
+
+        let counted = counting(stream, move |total| recorder.lock().unwrap().push(total));
+
+        assert_eq!(counted.collect().await.unwrap().len(), 6000);
+
+        let reported = reported.lock().unwrap();
+
+        assert!(reported.len() < 20, "reported {} times", reported.len());
+
+        // However few reports there were, the last one is the whole file — a bar that stops at
+        // 94% on a transfer that finished is worse than one that never moved.
+        assert_eq!(reported.last(), Some(&6000));
     }
 
     #[tokio::test]

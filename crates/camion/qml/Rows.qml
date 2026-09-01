@@ -6,6 +6,11 @@ import io.camion
 ListView {
     id: rows
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     required property var files
     required property var selection
 
@@ -13,7 +18,7 @@ ListView {
     function folderOf(row) {
         const name = files.nameAt(row)
 
-        return App.path === "/" ? "/" + name : App.path + "/" + name
+        return files.path === "/" ? "/" + name : files.path + "/" + name
     }
 
     /// The row the pointer is over, which the browser sets: the pointer is handled in one
@@ -87,6 +92,7 @@ ListView {
         /// up while it is under the pointer, and opens if you hold there.
         SpringLoaded {
             id: target
+            app: rows.app
             anchors.fill: parent
             folder: rows.folderOf(entry.index)
             enabled: entry.isFolder && !rows.selection.isSelected(entry.index)

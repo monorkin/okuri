@@ -79,12 +79,18 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        publish(Event::Failed { message: "one".to_owned() });
+        publish(Event::Failed {
+            concern: camion_engine::Concern::Everyone,
+            message: "one".to_owned(),
+        });
         assert_eq!(heard.load(Ordering::SeqCst), 1);
 
         drop(subscription);
 
-        publish(Event::Failed { message: "two".to_owned() });
+        publish(Event::Failed {
+            concern: camion_engine::Concern::Everyone,
+            message: "two".to_owned(),
+        });
         assert_eq!(heard.load(Ordering::SeqCst), 1);
     }
 }

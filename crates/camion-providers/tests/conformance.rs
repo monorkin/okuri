@@ -221,3 +221,295 @@ async fn sftp_conforms() {
 
     Conformance::new(&provider, scratch).run().await.assert_conformant();
 }
+
+/// What an S3-shaped store will and will not say about one file's readers.
+///
+/// Worth a real server rather than a unit test: whether a store answers per-file access control
+/// at all is the whole question, and no fake can tell you.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn s3_says_who_can_read_a_file_and_signs_a_link_to_it() {
+    use camion_core::{Provider, ProviderExt, Visibility};
+    use camion_providers::destination::{S3Preset, S3};
+    use camion_providers::s3::S3Provider;
+
+    let config = S3 {
+        bucket: "camion-test".to_owned(),
+        preset: S3Preset::Other,
+        region: "us-east-1".to_owned(),
+        endpoint: "http://localhost:9000".to_owned(),
+        root: String::new(),
+    };
+
+    let provider = S3Provider::connect(
+        &config,
+        &Secret::KeyPair { id: "camion".to_owned(), secret: "camion-secret".to_owned() },
+    )
+    .await
+    .expect("the compose MinIO to be running");
+
+    let path = RemotePath::parse("/shared.txt").unwrap();
+    let contents = b"anyone with the link";
+
+    provider.write_all(&path, bytes::Bytes::from_static(contents)).await.unwrap();
+
+    let sharing = provider.sharing().expect("an S3 connection shares files");
+
+    assert_eq!(sharing.visibility(&path).await.unwrap(), Visibility::Private);
+
+    // The address is where the file lives, so it reads the same whoever is asking.
+    assert_eq!(
+        sharing.public_url(&path),
+        "http://localhost:9000/camion-test/shared.txt"
+    );
+
+    // A signed link works without credentials even though the file is private. This is the
+    // part that holds on every store, which is why it is the one asserted end to end.
+    let link = sharing
+        .temporary_url(&path, std::time::Duration::from_secs(600))
+        .await
+        .unwrap();
+
+    let fetched = reqwest::get(&link).await.unwrap();
+
+    assert!(fetched.status().is_success(), "{}", fetched.status());
+    assert_eq!(fetched.bytes().await.unwrap(), &contents[..]);
+
+    // And the plain address does not, because the file is private.
+    assert_eq!(reqwest::get(sharing.public_url(&path)).await.unwrap().status(), 403);
+
+    provider.delete(&path).await.unwrap();
+}
+
+/// MinIO, Cloudflare R2, and any bucket made since 2023 decide who may read a whole bucket and
+/// refuse to talk about one file. What matters is that the refusal says so — read as a generic
+/// permissions error it sends you looking at your own credentials.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn a_store_that_will_not_share_one_file_says_why() {
+    use camion_core::{Provider, ProviderExt, Visibility};
+    use camion_providers::destination::{S3Preset, S3};
+    use camion_providers::s3::S3Provider;
+
+    let config = S3 {
+        bucket: "camion-test".to_owned(),
+        preset: S3Preset::Other,
+        region: "us-east-1".to_owned(),
+        endpoint: "http://localhost:9000".to_owned(),
+        root: String::new(),
+    };
+
+    let provider = S3Provider::connect(
+        &config,
+        &Secret::KeyPair { id: "camion".to_owned(), secret: "camion-secret".to_owned() },
+    )
+    .await
+    .expect("the compose MinIO to be running");
+
+    let path = RemotePath::parse("/unshareable.txt").unwrap();
+    provider.write_all(&path, bytes::Bytes::from_static(b"private")).await.unwrap();
+
+    let sharing = provider.sharing().unwrap();
+    let refused = sharing.set_visibility(&path, Visibility::Public).await.unwrap_err();
+
+    assert!(
+        refused.to_string().contains("decides who can read a bucket"),
+        "{refused}"
+    );
+
+    provider.delete(&path).await.unwrap();
+}
+
+/// Changing a file's mode, against a real server.
+///
+/// The interface offers tick boxes for this, and whether they do anything is a question only a
+/// server can answer — the mode has to come back changed on the next listing, not merely be
+/// accepted.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn sftp_changes_a_files_mode() {
+    use camion_core::{Permissions, Provider, ProviderExt};
+    use camion_providers::destination::{SshCredential, Sftp};
+    use camion_providers::sftp::SftpProvider;
+
+    let config = Sftp {
+        host: "localhost".to_owned(),
+        port: 2222,
+        username: "camion".to_owned(),
+        credential: SshCredential::Password,
+        home: "/scratch".to_owned(),
+    };
+
+    let provider = SftpProvider::connect(
+        &config,
+        &Secret::Password("camion".to_owned()),
+        Arc::new(TrustEverything),
+    )
+    .await
+    .expect("the compose SFTP server to be running");
+
+    let path = RemotePath::parse("/moded.txt").unwrap();
+    provider.write_all(&path, bytes::Bytes::from_static(b"mode")).await.unwrap();
+
+    let permitting = provider.permitting().expect("an SFTP connection keeps modes");
+
+    permitting.set_permissions(&path, Permissions(0o640)).await.unwrap();
+    assert_eq!(
+        provider.stat(&path).await.unwrap().permissions.unwrap().to_symbolic(),
+        "rw-r-----"
+    );
+
+    permitting.set_permissions(&path, Permissions(0o644)).await.unwrap();
+    assert_eq!(
+        provider.stat(&path).await.unwrap().permissions.unwrap().to_symbolic(),
+        "rw-r--r--"
+    );
+
+    provider.delete(&path).await.unwrap();
+}
+
+/// What an object store says about one object, against a real one.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn s3_says_how_a_file_is_served_and_stored() {
+    use camion_core::{Provider, ProviderExt};
+    use camion_providers::destination::{S3Preset, S3};
+    use camion_providers::s3::S3Provider;
+
+    let config = S3 {
+        bucket: "camion-test".to_owned(),
+        preset: S3Preset::Other,
+        region: "us-east-1".to_owned(),
+        endpoint: "http://localhost:9000".to_owned(),
+        root: String::new(),
+    };
+
+    let provider = S3Provider::connect(
+        &config,
+        &Secret::KeyPair { id: "camion".to_owned(), secret: "camion-secret".to_owned() },
+    )
+    .await
+    .expect("the compose MinIO to be running");
+
+    let path = RemotePath::parse("/described.txt").unwrap();
+    provider.write_all(&path, bytes::Bytes::from_static(b"described")).await.unwrap();
+
+    let served = provider.serving().unwrap().served(&path).await.unwrap();
+
+    // Unquoted: the protocol writes an ETag in quotes and they are not part of the value.
+    let etag = served.etag.expect("an ETag");
+    assert!(!etag.contains('"'), "{etag}");
+    assert_eq!(served.content_type.as_deref(), Some("text/plain"));
+
+    // MinIO says nothing about the class, which by the protocol means the ordinary one.
+    let stored = provider.storing().unwrap().stored(&path).await.unwrap();
+    assert_eq!(stored.class.as_deref(), Some("STANDARD"));
+    assert_eq!(stored.version, None);
+
+    // An SFTP notion, which an object store has no answer for and does not pretend to.
+    assert!(provider.owning().is_none());
+    assert!(provider.linking().is_none());
+
+    provider.delete(&path).await.unwrap();
+}
+
+/// And what a file server says, which is the other half of the vocabulary.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn sftp_says_who_owns_a_file_and_where_a_link_points() {
+    use camion_core::{Provider, ProviderExt};
+    use camion_providers::destination::{SshCredential, Sftp};
+    use camion_providers::sftp::SftpProvider;
+
+    let config = Sftp {
+        host: "localhost".to_owned(),
+        port: 2222,
+        username: "camion".to_owned(),
+        credential: SshCredential::Password,
+        home: "/scratch".to_owned(),
+    };
+
+    let provider = SftpProvider::connect(
+        &config,
+        &Secret::Password("camion".to_owned()),
+        Arc::new(TrustEverything),
+    )
+    .await
+    .expect("the compose SFTP server to be running");
+
+    let path = RemotePath::parse("/owned.txt").unwrap();
+    provider.write_all(&path, bytes::Bytes::from_static(b"owned")).await.unwrap();
+
+    let ownership = provider.owning().unwrap().ownership(&path).await.unwrap();
+    assert!(ownership.user.is_some(), "{ownership:?}");
+    assert!(ownership.group.is_some(), "{ownership:?}");
+
+    // Not a link, and says so rather than guessing.
+    assert_eq!(provider.linking().unwrap().link_target(&path).await.unwrap(), None);
+
+    // An object store's vocabulary, which a file server has no answer for.
+    assert!(provider.storing().is_none());
+
+    provider.delete(&path).await.unwrap();
+}
+
+/// A file uploaded through Camion has to arrive as what it is.
+///
+/// Nothing else can put this right afterwards: a store told nothing serves
+/// `application/octet-stream` for the life of the object, and every browser downloads it
+/// instead of showing it. Both upload paths are checked, because they are two different
+/// requests and the large one carries its headers somewhere else entirely.
+#[tokio::test]
+#[ignore = "needs test/compose.yaml"]
+async fn an_uploaded_file_says_what_it_is() {
+    use camion_core::{ByteStream, Provider, ProviderExt};
+    use camion_providers::destination::{S3Preset, S3};
+    use camion_providers::s3::S3Provider;
+
+    let config = S3 {
+        bucket: "camion-test".to_owned(),
+        preset: S3Preset::Other,
+        region: "us-east-1".to_owned(),
+        endpoint: "http://localhost:9000".to_owned(),
+        root: String::new(),
+    };
+
+    let provider = S3Provider::connect(
+        &config,
+        &Secret::KeyPair { id: "camion".to_owned(), secret: "camion-secret".to_owned() },
+    )
+    .await
+    .expect("the compose MinIO to be running");
+
+    let small = RemotePath::parse("/holiday.jpg").unwrap();
+    provider.write_all(&small, bytes::Bytes::from_static(b"not really a jpeg")).await.unwrap();
+
+    assert_eq!(
+        provider.serving().unwrap().served(&small).await.unwrap().content_type.as_deref(),
+        Some("image/jpeg")
+    );
+
+    // Over the part size, so it goes up as a multipart upload — where the type is stated when
+    // the upload begins rather than on any of the parts.
+    let large = RemotePath::parse("/holiday.png").unwrap();
+    let bytes = bytes::Bytes::from(vec![0u8; 9 * 1024 * 1024]);
+    provider.write(&large, ByteStream::once(bytes)).await.unwrap();
+
+    assert_eq!(
+        provider.serving().unwrap().served(&large).await.unwrap().content_type.as_deref(),
+        Some("image/png")
+    );
+
+    // A name that says nothing leaves the store to decide, rather than being told wrongly.
+    let unknown = RemotePath::parse("/LICENSE").unwrap();
+    provider.write_all(&unknown, bytes::Bytes::from_static(b"terms")).await.unwrap();
+
+    assert_eq!(
+        provider.serving().unwrap().served(&unknown).await.unwrap().content_type.as_deref(),
+        Some("application/octet-stream")
+    );
+
+    for path in [small, large, unknown] {
+        provider.delete(&path).await.unwrap();
+    }
+}

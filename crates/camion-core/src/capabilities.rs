@@ -20,6 +20,24 @@ impl Support {
     }
 }
 
+/// Which kinds of thing a destination knows about one file.
+///
+/// Not the answers — those come one file at a time — but which questions are worth asking, so a
+/// panel showing a file can put the rows on screen before the server has replied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Details {
+    pub owning: bool,
+    pub linking: bool,
+    pub serving: bool,
+    pub storing: bool,
+}
+
+impl Details {
+    pub const fn none() -> Self {
+        Self { owning: false, linking: false, serving: false, storing: false }
+    }
+}
+
 /// What a connection can do, as data the UI can read.
 ///
 /// Menu items are enabled from this rather than from a match on the provider kind, so adding a
@@ -29,11 +47,29 @@ pub struct Capabilities {
     pub rename: Support,
     pub create_folder: Support,
     pub empty_folders: Support,
+
+    /// Whether files here can be handed to somebody with no account — made public, and given
+    /// an address that works without credentials. The interface offers none of it otherwise.
+    ///
+    /// Not set by the adapters: the engine fills it in from whether the provider actually
+    /// answers [`Provider::sharing`](crate::Provider::sharing), so it cannot claim something
+    /// the adapter has not implemented.
+    pub sharing: bool,
+
+    /// Whether a file's mode can be changed here. Filled in the same way, from
+    /// [`Provider::permitting`](crate::Provider::permitting).
+    pub permissions: bool,
+
+    /// Which of the optional traits this destination answers, so the interface can reserve room
+    /// for what is coming rather than growing a row at a time as each answer lands.
+    ///
+    /// Filled in by the engine from the accessors, like the two above.
+    pub details: Details,
     /// How many transfers this kind of destination will take at once.
     ///
-    /// Stated rather than inferred from the other flags: eight parallel uploads is polite to an
-    /// object store and rude to a small FTP server, and nothing else here can tell the two
-    /// apart.
+    /// Stated rather than inferred from the other flags: two dozen parallel uploads is nothing
+    /// to an object store and rude to a small FTP server, and nothing else here can tell the
+    /// two apart.
     pub transfer_slots: usize,
 }
 
@@ -44,6 +80,9 @@ impl Capabilities {
             rename: Support::Native,
             create_folder: Support::Native,
             empty_folders: Support::Native,
+            sharing: false,
+            permissions: false,
+            details: Details::none(),
             transfer_slots: 4,
         }
     }
@@ -54,7 +93,13 @@ impl Capabilities {
             rename: Support::Emulated,
             create_folder: Support::Emulated,
             empty_folders: Support::Emulated,
-            transfer_slots: 8,
+            sharing: false,
+            permissions: false,
+            details: Details::none(),
+            // Object stores answer over HTTP and are built to be asked many things at once.
+            // With thousands of small files the time is nearly all round trips, so this is
+            // close to a straight multiplier on how long the whole drop takes.
+            transfer_slots: 24,
         }
     }
 

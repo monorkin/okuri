@@ -1,8 +1,62 @@
-use camion_core::{Capabilities, Entry, RemotePath};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use camion_core::{Capabilities, Entry, Ownership, RemotePath, Served, Stored};
 use tokio::sync::oneshot;
 
 use crate::session::SessionId;
 use crate::transfer::{Transfer, TransferId};
+
+/// One try at opening a connection, from the moment it is asked for until it becomes a session
+/// or fails.
+///
+/// Minted by whoever asks and handed back on everything that try produces. Connecting is the
+/// one stretch of work with no session to name it by, and it is also the stretch that asks the
+/// most questions — a host key, a password, a passphrase. With more than one window open,
+/// "somebody is being asked for a password" does not say which window should be asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Attempt(pub u64);
+
+impl Attempt {
+    pub fn next() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Whose work an event is about.
+///
+/// Most events name a session and need nothing else. This is for the two that cannot: something
+/// that went wrong while a connection was still being opened, and a question asked in the
+/// middle of opening it. Without it, one window's password prompt appears in every window, and
+/// one window's failure is reported by all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Concern {
+    /// Camion itself rather than any one connection — a config file that will not parse, a
+    /// `known_hosts` that cannot be read.
+    Everyone,
+
+    /// A connection being opened, which has no session yet.
+    Attempt(Attempt),
+
+    /// An open connection.
+    Session(SessionId),
+}
+
+impl Concern {
+    /// Whether work named by `session` is this concern's own.
+    pub fn is_session(&self, session: SessionId) -> bool {
+        matches!(self, Self::Session(theirs) if *theirs == session)
+    }
+
+    pub fn is_attempt(&self, attempt: Attempt) -> bool {
+        matches!(self, Self::Attempt(theirs) if *theirs == attempt)
+    }
+
+    pub fn is_everyone(&self) -> bool {
+        matches!(self, Self::Everyone)
+    }
+}
 
 /// Everything the interface learns, on one channel.
 ///
@@ -10,8 +64,11 @@ use crate::transfer::{Transfer, TransferId};
 /// updates and does nothing else, and the whole application can be watched at one seam.
 #[derive(Debug)]
 pub enum Event {
-    Connecting { connection: String },
+    Connecting { attempt: Attempt, connection: String },
     Connected {
+        /// Which try this is the end of, so the window that asked is the one that gets the
+        /// connection rather than whichever window happens to be listening.
+        attempt: Attempt,
         session: SessionId,
         label: String,
         capabilities: Capabilities,
@@ -19,7 +76,7 @@ pub enum Event {
         /// outside Camion.
         home: String,
     },
-    ConnectionFailed { connection: String, reason: String },
+    ConnectionFailed { attempt: Attempt, connection: String, reason: String },
     Disconnected { session: SessionId },
 
     /// A folder's contents, ready to be shown. Carries the path so a listing that arrives after
@@ -31,11 +88,75 @@ pub enum Event {
     TransferProgress { transfer: TransferId, transferred: u64 },
     TransferFinished { transfer: TransferId, outcome: Outcome },
 
+    /// What is known about who can read a file, and the address it has either way.
+    ///
+    /// `public` is `None` when the store would not say — reading a file's permissions is itself
+    /// a permission, and plenty of accounts can read a file without being allowed to ask who
+    /// else can. That is not a failure worth a banner; it is an answer of "cannot tell".
+    Shared {
+        session: SessionId,
+        name: String,
+        public: Option<bool>,
+        /// Why not, when `public` is `None`.
+        why_not: String,
+        url: String,
+    },
+
+    /// Everything else the destination knows about one file.
+    ///
+    /// Each part is absent when the destination has no notion of it — an object store has no
+    /// group, an SFTP server no storage class. Typed rather than labelled text, so what is on
+    /// screen is the interface's wording and what is here can be acted on later.
+    Described {
+        session: SessionId,
+        name: String,
+        ownership: Option<Ownership>,
+        link_target: Option<String>,
+        served: Option<Served>,
+        stored: Option<Stored>,
+    },
+
+    /// A signed link to a file, good for a while.
+    Linked { session: SessionId, name: String, url: String },
+
     /// Something went wrong that the user should see but that stops nothing else.
-    Failed { message: String },
+    Failed { concern: Concern, message: String },
+
+    /// Something went right that is worth confirming. Saving a credential leaves nothing on
+    /// screen to show for it, and silence is indistinguishable from having done nothing.
+    Notice { concern: Concern, message: String },
 
     /// A question that has to be answered before the work in flight can continue.
     Ask(Prompt),
+}
+
+impl Event {
+    /// Whose news this is.
+    ///
+    /// The transfer events answer [`Concern::Everyone`] deliberately: the queue is one queue
+    /// for the whole application, and a transfer started in one window is still moving when
+    /// that window is looking at something else.
+    pub fn concern(&self) -> Concern {
+        match self {
+            Self::Connecting { attempt, .. }
+            | Self::Connected { attempt, .. }
+            | Self::ConnectionFailed { attempt, .. } => Concern::Attempt(*attempt),
+
+            Self::Disconnected { session }
+            | Self::Listing { session, .. }
+            | Self::Working { session, .. }
+            | Self::Shared { session, .. }
+            | Self::Described { session, .. }
+            | Self::Linked { session, .. } => Concern::Session(*session),
+
+            Self::Failed { concern, .. } | Self::Notice { concern, .. } => *concern,
+            Self::Ask(prompt) => prompt.concern,
+
+            Self::TransferAdded(_)
+            | Self::TransferProgress { .. }
+            | Self::TransferFinished { .. } => Concern::Everyone,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +175,12 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct Prompt {
     pub question: Question,
+
+    /// Whose work this is holding up, so exactly one window asks it. Two dialogs over one
+    /// question is worse than it sounds: the first answer releases the work and the second
+    /// dialog stays on screen asking about something that has already happened.
+    pub concern: Concern,
+
     reply: std::sync::Mutex<Option<oneshot::Sender<Answer>>>,
 }
 
@@ -117,10 +244,13 @@ impl Answer {
 }
 
 impl Prompt {
-    pub fn new(question: Question) -> (Self, oneshot::Receiver<Answer>) {
+    pub fn new(concern: Concern, question: Question) -> (Self, oneshot::Receiver<Answer>) {
         let (reply, answer) = oneshot::channel();
 
-        (Self { question, reply: std::sync::Mutex::new(Some(reply)) }, answer)
+        (
+            Self { question, concern, reply: std::sync::Mutex::new(Some(reply)) },
+            answer,
+        )
     }
 
     /// Answers the question, releasing whatever was waiting on it. Answering twice is harmless:
@@ -146,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn answering_releases_whatever_was_waiting() {
-        let (prompt, waiting) = Prompt::new(Question::Passphrase);
+        let (prompt, waiting) = Prompt::new(Concern::Everyone, Question::Passphrase);
 
         prompt.answer(Answer::Text("correct horse".to_owned()));
 
@@ -155,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prompt_nobody_answers_counts_as_declining() {
-        let (prompt, waiting) = Prompt::new(Question::UnknownHostKey {
+        let (prompt, waiting) = Prompt::new(Concern::Everyone, Question::UnknownHostKey {
             host: "example.com".to_owned(),
             algorithm: "ssh-ed25519".to_owned(),
             fingerprint: "SHA256:whatever".to_owned(),

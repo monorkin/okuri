@@ -9,17 +9,22 @@ import io.camion
 Dialog {
     id: ask
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     modal: true
     closePolicy: Popup.NoAutoClose
     anchors.centerIn: Overlay.overlay
     width: Math.min(480, Overlay.overlay ? Overlay.overlay.width - 60 : 480)
-    visible: App.asking
+    visible: app.asking
 
     background: Rectangle {
         radius: 10
         color: Theme.elevated
         border.width: 1
-        border.color: App.questionIsGrave ? Theme.error : Theme.border
+        border.color: app.questionIsGrave ? Theme.error : Theme.border
     }
 
     onVisibleChanged: {
@@ -36,15 +41,15 @@ Dialog {
 
         Text {
             width: parent.width - 40
-            text: App.questionTitle
+            text: app.questionTitle
             font.pixelSize: 17
-            color: App.questionIsGrave ? Theme.error : Theme.bright
+            color: app.questionIsGrave ? Theme.error : Theme.bright
             wrapMode: Text.WordWrap
         }
 
         Text {
             width: parent.width - 40
-            text: App.questionBody
+            text: app.questionBody
             visible: text !== ""
             color: Theme.foreground
             wrapMode: Text.WordWrap
@@ -54,7 +59,7 @@ Dialog {
         Rectangle {
             width: parent.width - 40
             height: fingerprint.implicitHeight + 20
-            visible: App.questionDetail !== ""
+            visible: app.questionDetail !== ""
             radius: 6
             color: Theme.surface
 
@@ -62,7 +67,7 @@ Dialog {
                 id: fingerprint
                 anchors.centerIn: parent
                 width: parent.width - 20
-                text: App.questionDetail
+                text: app.questionDetail
                 font.family: "monospace"
                 color: Theme.foreground
                 wrapMode: Text.WrapAnywhere
@@ -73,19 +78,19 @@ Dialog {
         Field {
             id: first
             width: parent.width - 40
-            visible: App.questionWantsText || App.questionWantsPair
-            label: App.questionFirstLabel
+            visible: app.questionWantsText || app.questionWantsPair
+            label: app.questionFirstLabel
             // An access key is not a secret and is easier to check when you can read it.
-            secret: App.questionIsSecret && !App.questionWantsPair
+            secret: app.questionIsSecret && !app.questionWantsPair
             onAccepted: ask.confirm()
         }
 
         Field {
             id: second
             width: parent.width - 40
-            visible: App.questionWantsPair
-            label: App.questionSecondLabel
-            secret: App.questionIsSecret
+            visible: app.questionWantsPair
+            label: app.questionSecondLabel
+            secret: app.questionIsSecret
             onAccepted: ask.confirm()
         }
 
@@ -96,19 +101,19 @@ Dialog {
 
             FlatButton {
                 text: "Cancel"
-                onClicked: App.answer(false, "", "")
+                onClicked: app.answer(false, "", "")
             }
 
             /// Only some questions have a third answer — replacing a file can also mean
             /// keeping both — so this is here when there is one and gone when there is not.
             FlatButton {
-                text: App.questionAlternative
-                visible: App.questionAlternative !== ""
-                onClicked: App.answerAlternative()
+                text: app.questionAlternative
+                visible: app.questionAlternative !== ""
+                onClicked: app.answerAlternative()
             }
 
             FlatButton {
-                text: App.questionAccept
+                text: app.questionAccept
                 highlighted: true
                 onClicked: ask.confirm()
             }
@@ -116,6 +121,6 @@ Dialog {
     }
 
     function confirm() {
-        App.answer(true, first.text, second.text)
+        app.answer(true, first.text, second.text)
     }
 }

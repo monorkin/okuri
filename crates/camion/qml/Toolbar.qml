@@ -6,11 +6,17 @@ import io.camion
 Rectangle {
     id: toolbar
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     required property var files
     required property var transfers
 
     signal showTransfers()
     signal newConnection()
+    signal newWindow()
     signal editColumns()
 
     implicitHeight: 52
@@ -25,38 +31,38 @@ Rectangle {
         FlatButton {
             text: "←"
             hint: "Parent folder"
-            enabled: App.connected && !App.atRoot
-            onClicked: App.up()
+            enabled: app.connected && !app.atRoot
+            onClicked: app.up()
         }
 
         FlatButton {
             text: "↻"
             hint: "Refresh"
-            enabled: App.connected
-            onClicked: App.refresh()
+            enabled: app.connected
+            onClicked: app.refresh()
         }
 
         Breadcrumb {
+            app: toolbar.app
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
-            visible: App.connected
+            visible: app.connected
         }
 
         Item {
             Layout.fillWidth: true
-            visible: !App.connected
+            visible: !app.connected
         }
 
-        BusyIndicator {
-            running: toolbar.files.working || App.connecting
-            visible: running
-            implicitWidth: 20
-            implicitHeight: 20
+        // Only for work that has somewhere else to be shown: connecting says so in the row
+        // that was clicked, and a first listing says so in the middle of the window.
+        Spinner {
+            running: toolbar.files.working && toolbar.files.count > 0
         }
 
         FlatButton {
             text: "New connection"
-            visible: !App.connected
+            visible: !app.connected
             onClicked: toolbar.newConnection()
         }
 
@@ -66,7 +72,7 @@ Rectangle {
             id: display
 
             Layout.alignment: Qt.AlignVCenter
-            visible: App.connected
+            visible: app.connected
             implicitWidth: mode.implicitWidth + options.implicitWidth + 1
             implicitHeight: 30
             radius: 6
@@ -112,17 +118,28 @@ Rectangle {
             text: toolbar.transfers.active > 0
                 ? "↑ " + toolbar.transfers.active
                 : "↑"
-            // Nothing can be transferring with nothing open, so there is nothing to look at.
-            enabled: App.connected
+            // The queue is one queue for the whole application, so a window with nothing open
+            // can still be the one you happen to be looking at while a transfer started
+            // somewhere else is running.
+            enabled: app.connected || toolbar.transfers.count > 0
             highlighted: toolbar.transfers.active > 0
             onClicked: toolbar.showTransfers()
+        }
+
+        // Always here, connected or not. A second window is how you reach a second server, so
+        // hiding it until you have reached the first one has it missing exactly when somebody
+        // wants two things open side by side.
+        FlatButton {
+            hint: "New window"
+            text: "❐"
+            onClicked: toolbar.newWindow()
         }
 
         FlatButton {
             hint: "Disconnect"
             text: "✕"
-            visible: App.connected
-            onClicked: App.disconnect()
+            visible: app.connected
+            onClicked: app.disconnect()
         }
     }
 

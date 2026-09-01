@@ -63,6 +63,11 @@ pub mod qobject {
         #[qinvokable]
         fn forget(self: Pin<&mut ConnectionList>, id: QString);
 
+        /// Whether this connection signs in with something worth changing. An SFTP connection
+        /// using the agent has nothing stored, so there is nothing to offer.
+        #[qinvokable]
+        fn needs_credentials(self: &ConnectionList, id: QString) -> bool;
+
         #[qinvokable]
         fn id_at(self: &ConnectionList, row: i32) -> QString;
 
@@ -160,6 +165,13 @@ impl qobject::ConnectionList {
     pub fn forget(mut self: Pin<&mut Self>, id: QString) {
         self.as_mut().rust_mut().connections.remove(&id.to_string());
         self.persist();
+    }
+
+    pub fn needs_credentials(&self, id: QString) -> bool {
+        self.rust()
+            .connections
+            .find(&id.to_string())
+            .is_some_and(|connection| connection.destination.needs_secret())
     }
 
     pub fn id_at(&self, row: i32) -> QString {

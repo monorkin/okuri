@@ -6,6 +6,11 @@ import io.camion
 Rectangle {
     id: picker
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     signal chosen(string id)
     signal compose()
     signal edit(string id)
@@ -24,12 +29,6 @@ Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
         }
 
-        Text {
-            text: "Open a connection, or add one."
-            color: Theme.muted
-            anchors.horizontalCenter: parent.horizontalCenter
-        }
-
         Rectangle {
             width: parent.width
             height: Math.min(300, Math.max(60, ConnectionList.count * 58))
@@ -44,7 +43,13 @@ Rectangle {
                 anchors.fill: parent
                 anchors.margins: 1
                 model: ConnectionList
+                currentIndex: -1
                 boundsBehavior: Flickable.StopAtBounds
+                focus: true
+
+                // Enter opens whatever is picked, so the keyboard can do what the mouse does.
+                Keys.onReturnPressed: picker.chosen(ConnectionList.idAt(saved.currentIndex))
+                Keys.onEnterPressed: picker.chosen(ConnectionList.idAt(saved.currentIndex))
 
                 ScrollBar.vertical: ScrollBar {}
 
@@ -59,13 +64,31 @@ Rectangle {
 
                     width: saved.width
                     height: 58
-                    color: hover.containsMouse ? Theme.elevated : "transparent"
+                    color: {
+                        if (row.opening || saved.currentIndex === row.index) {
+                            return Theme.elevated
+                        }
 
+                        return within.hovered ? Qt.alpha(Theme.foreground, 0.06) : "transparent"
+                    }
+
+                    readonly property bool opening: app.connectingTo === row.identifier
+
+                    /// Whether the pointer is anywhere over this row, the Edit button included.
+                    ///
+                    /// A `HoverHandler` rather than the `MouseArea` below: a button on top of a
+                    /// mouse area takes the hover away from it, so reaching for Edit made Edit
+                    /// vanish and the click landed on the row instead.
+                    HoverHandler {
+                        id: within
+                    }
+
+                    /// Opened by double-clicking, the way a file manager opens anything. A
+                    /// single click selects, and selecting must not be enough to start dialling
+                    /// a server — reaching Edit meant connecting to whatever you passed over.
                     MouseArea {
-                        id: hover
                         anchors.fill: parent
-                        hoverEnabled: true
-                        onClicked: picker.chosen(row.identifier)
+                        onClicked: saved.currentIndex = row.index
                         onDoubleClicked: picker.chosen(row.identifier)
                     }
 
@@ -87,12 +110,21 @@ Rectangle {
                         }
                     }
 
+                    /// Where the waiting is shown: in the row that was clicked, because that is
+                    /// where whoever clicked it is looking.
+                    Spinner {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 16
+                        anchors.verticalCenter: parent.verticalCenter
+                        running: row.opening
+                    }
+
                     FlatButton {
                         anchors.right: parent.right
                         anchors.rightMargin: 10
                         anchors.verticalCenter: parent.verticalCenter
                         text: "Edit"
-                        visible: hover.containsMouse
+                        visible: within.hovered && !row.opening
                         onClicked: picker.edit(row.identifier)
                     }
                 }
@@ -101,7 +133,7 @@ Rectangle {
             Text {
                 anchors.centerIn: parent
                 visible: ConnectionList.count === 0
-                text: "Nothing saved yet."
+                text: "No connections yet"
                 color: Theme.muted
             }
         }

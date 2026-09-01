@@ -30,13 +30,15 @@ Item {
             font.pixelSize: 12
         }
 
+        /// Bigger than the heading it sits beside, not smaller: these are the only mark saying
+        /// which column the list is ordered by, and at the size of a full stop they read as one.
         Text {
             text: Display.sortDescending ? "▾" : "▴"
             height: parent.height
             verticalAlignment: Text.AlignVCenter
             visible: heading.sorting
-            color: Theme.muted
-            font.pixelSize: 10
+            color: Theme.foreground
+            font.pixelSize: 16
         }
     }
 

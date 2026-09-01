@@ -10,6 +10,11 @@ import io.camion
 GridView {
     id: grid
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     required property var files
     required property var selection
 
@@ -17,7 +22,7 @@ GridView {
     function folderOf(row) {
         const name = files.nameAt(row)
 
-        return App.path === "/" ? "/" + name : App.path + "/" + name
+        return files.path === "/" ? "/" + name : files.path + "/" + name
     }
 
     /// The cell the pointer is over, which the browser sets: the pointer is handled in one
@@ -66,6 +71,7 @@ GridView {
             /// opens if you hold there.
             SpringLoaded {
                 id: target
+                app: grid.app
                 anchors.fill: parent
                 folder: grid.folderOf(cell.index)
                 enabled: cell.isFolder && !grid.selection.isSelected(cell.index)

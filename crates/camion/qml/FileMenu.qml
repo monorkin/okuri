@@ -9,6 +9,11 @@ import io.camion
 Menu {
     id: menu
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     property int rows: 0
     property bool onFolder: false
 
@@ -45,7 +50,7 @@ Menu {
 
     MenuItem {
         text: "Rename…"
-        enabled: menu.one && App.canRename
+        enabled: menu.one && app.canRename
         onTriggered: menu.renameRequested()
     }
 
@@ -59,12 +64,12 @@ Menu {
 
     MenuItem {
         text: "New folder…"
-        enabled: App.canCreateFolder
+        enabled: app.canCreateFolder
         onTriggered: menu.newFolderRequested()
     }
 
     MenuItem {
         text: "Refresh"
-        onTriggered: App.refresh()
+        onTriggered: app.refresh()
     }
 }

@@ -42,6 +42,40 @@ pub trait Provider: Send + Sync {
         String::new()
     }
 
+    /// Who files here belong to, if anyone.
+    fn owning(&self) -> Option<&dyn crate::Owning> {
+        None
+    }
+
+    /// Where a link points, for destinations that have links.
+    fn linking(&self) -> Option<&dyn crate::Linking> {
+        None
+    }
+
+    /// How files here are served over HTTP, for destinations that are.
+    fn serving(&self) -> Option<&dyn crate::Serving> {
+        None
+    }
+
+    /// How the store keeps a file — its class, its encryption, its version.
+    fn storing(&self) -> Option<&dyn crate::Storing> {
+        None
+    }
+
+    /// How this destination hands files to people with no account, if it can at all.
+    ///
+    /// Most cannot, and say so by leaving this alone. Kept off the verb list above because a
+    /// destination that has no notion of public files should not have to decline a method —
+    /// and because the interface has to know whether to offer any of it before it asks.
+    fn sharing(&self) -> Option<&dyn crate::Sharing> {
+        None
+    }
+
+    /// How this destination changes a file's mode, if it keeps one at all.
+    fn permitting(&self) -> Option<&dyn crate::Permitting> {
+        None
+    }
+
     /// Closes the underlying connection. Providers that are stateless leave this alone.
     async fn disconnect(&self) -> Result<()> {
         Ok(())
@@ -92,33 +126,6 @@ pub trait ProviderExt: Provider {
         self.delete(path).await
     }
 
-    /// A name that does not collide, by adding ` (2)`, ` (3)`, and so on before the extension.
-    /// This is what a drop of an already-present file becomes when the user chooses to keep both.
-    async fn unused_name(&self, folder: &RemotePath, name: &str) -> Result<String> {
-        let candidate = folder.join(name)?;
-
-        if !self.exists(&candidate).await? {
-            return Ok(name.to_owned());
-        }
-
-        let stem = candidate.stem().unwrap_or(name).to_owned();
-        let extension = candidate.extension().map(str::to_owned);
-
-        let mut suffix = 2;
-
-        loop {
-            let name = match &extension {
-                Some(extension) => format!("{stem} ({suffix}).{extension}"),
-                None => format!("{stem} ({suffix})"),
-            };
-
-            if !self.exists(&folder.join(&name)?).await? {
-                return Ok(name);
-            }
-
-            suffix += 1;
-        }
-    }
 }
 
 impl<T: Provider + ?Sized> ProviderExt for T {}

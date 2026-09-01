@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use camion_core::{
@@ -6,11 +7,14 @@ use camion_core::{
 };
 use futures::StreamExt;
 use suppaftp::list::File as Listed;
-use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
+use suppaftp::tokio::{
+    AsyncDataStream, AsyncRustlsConnector, AsyncRustlsFtpStream, AsyncRustlsStream,
+};
+
 use suppaftp::types::FileType;
 use suppaftp::{FtpError, Mode};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::destination::Ftp as FtpConfig;
 use crate::secret::Secret;
@@ -23,7 +27,7 @@ use crate::secret::Secret;
 pub struct FtpProvider {
     label: String,
     home: String,
-    stream: Mutex<AsyncRustlsFtpStream>,
+    stream: Arc<Mutex<AsyncRustlsFtpStream>>,
 }
 
 impl FtpProvider {
@@ -81,7 +85,7 @@ impl FtpProvider {
         Ok(Self {
             label: format!("{}@{}", config.username, config.host),
             home: home.trim_end_matches('/').to_owned(),
-            stream: Mutex::new(stream),
+            stream: Arc::new(Mutex::new(stream)),
         })
     }
 }
@@ -141,43 +145,35 @@ impl Provider for FtpProvider {
     }
 
     async fn read(&self, path: &RemotePath, range: Option<ByteRange>) -> Result<ByteStream> {
-        let mut stream = self.stream.lock().await;
+        let mut stream = Arc::clone(&self.stream).lock_owned().await;
+        let size = stream.size(self.at(path)).await.ok().map(|size| size as u64);
+
+        // Asked of the server rather than by reading and throwing away: `REST` says where the
+        // next transfer starts, which is the difference between skipping a gigabyte and
+        // downloading one to ignore it.
+        let offset = range.map(|range| range.offset).unwrap_or_default();
+
+        if offset > 0 {
+            stream
+                .resume_transfer(usize::try_from(offset).unwrap_or(usize::MAX))
+                .await
+                .map_err(|error| translate(error, path))?;
+        }
 
         let reader = stream
             .retr_as_stream(self.at(path))
             .await
             .map_err(|error| translate(error, path))?;
 
-        // The data connection has to be read to its end before the control connection is
-        // usable again, so the whole file is taken here rather than handed out as a stream
-        // that could be dropped half way through and wedge the session.
-        let mut bytes = Vec::new();
-        let mut reader = reader;
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
-            .await
-            .map_err(|error| Error::caused_by("the download was interrupted", error))?;
-
-        stream
-            .finalize_retr_stream(reader)
-            .await
-            .map_err(|error| translate(error, path))?;
-
-        let bytes = match range {
-            None => bytes,
-            Some(range) => {
-                let start = usize::try_from(range.offset).unwrap_or(usize::MAX).min(bytes.len());
-                let end = match range.length {
-                    Some(length) => start.saturating_add(
-                        usize::try_from(length).unwrap_or(usize::MAX),
-                    ).min(bytes.len()),
-                    None => bytes.len(),
-                };
-
-                bytes[start..end].to_vec()
-            }
+        let wanted = match range.and_then(|range| range.length) {
+            Some(length) => Some(length),
+            None => size.map(|size| size.saturating_sub(offset)),
         };
 
-        Ok(ByteStream::once(bytes))
+        let downloading =
+            Downloading { stream: Some(stream), reader: Some(reader), taken: 0, wanted };
+
+        Ok(ByteStream::new(downloading.into_stream(), wanted))
     }
 
     async fn write(&self, path: &RemotePath, mut body: ByteStream) -> Result<()> {
@@ -251,6 +247,119 @@ fn encryption() -> Result<AsyncRustlsConnector> {
 }
 
 
+
+/// One file coming down, with the control connection held for as long as it takes.
+///
+/// FTP moves the bytes on a second connection and reports how it went on the first, so the
+/// control connection cannot be used again until this one is finished with. Holding the lock
+/// inside the stream is what makes that true — and it is what lets a download be handed out as
+/// a stream at all, rather than read into memory to get the lock back quickly.
+struct Downloading {
+    stream: Option<OwnedMutexGuard<AsyncRustlsFtpStream>>,
+    reader: Option<AsyncDataStream<AsyncRustlsStream>>,
+    taken: u64,
+    /// How much was asked for, when that is known. A range wants less than the rest of the
+    /// file, and the server will happily keep sending past it.
+    wanted: Option<u64>,
+}
+
+/// How much of a download is asked for at a time.
+const READ_CHUNK: usize = 256 * 1024;
+
+impl Downloading {
+    /// The next piece of the file, or `None` once there is none.
+    ///
+    /// Written as one `async fn` rather than a hand-rolled `poll_next`, because finishing means
+    /// awaiting the closing response — and a poll function has to hold that half-finished
+    /// future across polls. Getting that wrong drops it and leaves the response unread, which
+    /// desynchronises the control connection: every later command reads the previous one's
+    /// answer.
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>> {
+        use tokio::io::AsyncReadExt;
+
+        let left = match self.wanted {
+            Some(wanted) => wanted.saturating_sub(self.taken),
+            None => u64::MAX,
+        };
+
+        if left == 0 {
+            self.finish().await?;
+
+            return Ok(None);
+        }
+
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(None);
+        };
+
+        let mut buffer = vec![0u8; READ_CHUNK.min(left as usize)];
+
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            // Left in place so that dropping this aborts the transfer properly rather than
+            // walking away from a connection the server is still writing to.
+            Err(error) => {
+                return Err(Error::caused_by("the download was interrupted", error));
+            }
+        };
+
+        if read == 0 {
+            self.finish().await?;
+
+            return Ok(None);
+        }
+
+        buffer.truncate(read);
+        self.taken += read as u64;
+
+        Ok(Some(bytes::Bytes::from(buffer)))
+    }
+
+    /// Reads the closing response, which is what leaves the connection usable.
+    async fn finish(&mut self) -> Result<()> {
+        let (Some(mut stream), Some(reader)) = (self.stream.take(), self.reader.take()) else {
+            return Ok(());
+        };
+
+        stream
+            .finalize_retr_stream(reader)
+            .await
+            .map_err(|error| Error::caused_by("the download did not finish cleanly", error))
+    }
+
+    /// The stream the rest of the application sees.
+    fn into_stream(self) -> impl futures::Stream<Item = Result<bytes::Bytes>> + Send {
+        futures::stream::unfold(Some(self), |state| async move {
+            let mut downloading = state?;
+
+            match downloading.next_chunk().await {
+                Ok(Some(bytes)) => Some((Ok(bytes), Some(downloading))),
+                Ok(None) => None,
+                // Handed back once, and then nothing: dropping the state here is what aborts
+                // the transfer and hands the connection back.
+                Err(error) => Some((Err(error), None)),
+            }
+        })
+    }
+}
+
+impl Drop for Downloading {
+    /// A download let go of half way through leaves the server still sending. `ABOR` stops it
+    /// and reads the response, which is what keeps the connection usable — without it every
+    /// later command would be reading the leftovers of this one.
+    fn drop(&mut self) {
+        let (Some(mut stream), Some(reader)) = (self.stream.take(), self.reader.take()) else {
+            return;
+        };
+
+        // Dropping cannot wait, so the tidying up is left running behind us. The lock goes back
+        // only once that is done, which is what makes the next command queue behind it rather
+        // than talk over it.
+        tokio::spawn(async move {
+            let _ = stream.abort(reader).await;
+        });
+    }
+}
 
 fn describe(listed: &Listed) -> Entry {
     let mut entry = match listed.is_directory() {

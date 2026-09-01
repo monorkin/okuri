@@ -7,8 +7,7 @@ use camion_core::RemotePath;
 
 use crate::screen::Screen;
 use camion_engine::engine::Command;
-use camion_engine::secrets::{EncryptedFile, InMemory, Keyring};
-use camion_engine::{Answer, Engine, Event, Question, SessionId, Vault};
+use camion_engine::{Answer, Attempt, Event, Question, SessionId};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QString, QStringList};
 
@@ -19,6 +18,10 @@ use crate::format;
 /// Holds the current connection and folder, turns clicks and keystrokes into engine commands,
 /// and puts questions from the engine on screen. It contains no logic about how to reach a
 /// server and none about how to draw a list — only about what the person asked for.
+///
+/// One per window rather than one per application. Two windows are two connections, two open
+/// folders and two selections, and the engine has always been able to hold several sessions at
+/// once — this was the only thing insisting there be one of everything.
 #[cxx_qt::bridge]
 pub mod qobject {
     unsafe extern "C++" {
@@ -32,16 +35,48 @@ pub mod qobject {
     extern "RustQt" {
         #[qobject]
         #[qml_element]
-        #[qml_singleton]
+        /// Which connection this window has open, or zero. Read by the file list, so that a
+        /// listing arriving for another window's connection is not drawn over this one's.
+        #[qproperty(i64, session)]
+        /// Whether this is the window Camion opened with. It takes the connection named on the
+        /// command line, and it is where a question that belongs to no connection is asked.
+        #[qproperty(bool, primary)]
         #[qproperty(bool, connected)]
         #[qproperty(bool, connecting)]
+        /// Which saved connection is being opened, or empty. The row that was clicked is where
+        /// somebody is looking, so it is where the waiting has to be shown.
+        #[qproperty(QString, connecting_to)]
         #[qproperty(QString, label)]
         #[qproperty(QString, path)]
+        /// Where the open folder sits on the server, which is not what the breadcrumb shows.
+        #[qproperty(QString, absolute_path)]
         #[qproperty(bool, at_root)]
         #[qproperty(bool, can_rename)]
         #[qproperty(bool, can_create_folder)]
         #[qproperty(bool, rename_is_a_copy)]
+        /// Whether this destination can hand files to people with no account.
+        #[qproperty(bool, can_share)]
+        /// Whether a file's mode can be changed here.
+        #[qproperty(bool, can_set_permissions)]
+        /// What the last answer about a shared file said, for the panel showing it.
+        #[qproperty(QString, shared_name)]
+        #[qproperty(bool, shared_is_public)]
+        /// Whether the store would say at all. A file whose permissions cannot be read is not
+        /// the same as a private one, and the switch must not claim otherwise.
+        #[qproperty(bool, shared_is_known)]
+        #[qproperty(QString, shared_why_not)]
+        #[qproperty(QString, shared_url)]
+        /// A link that works for a week without an account, once one has been asked for.
+        #[qproperty(QString, signed_url)]
+        /// Everything else the destination said about the file being looked at, as label and
+        /// value in the order it arrived.
+        #[qproperty(QStringList, facts)]
+        /// Whether that answer is still on its way, and which rows it will fill when it lands.
+        #[qproperty(bool, describing)]
+        #[qproperty(QStringList, expected_facts)]
         #[qproperty(QString, message)]
+        /// Whether the message is bad news, so the strip can be coloured like it.
+        #[qproperty(bool, message_is_grave)]
         /// Where the files being dragged live, for whatever they are dropped on.
         #[qproperty(QStringList, drag_urls)]
         /// What a drag inside the window is carrying. Held here rather than in one corner of
@@ -70,6 +105,30 @@ pub mod qobject {
         fn connect_to(self: Pin<&mut App>, id: QString);
         #[qinvokable]
         fn disconnect(self: Pin<&mut App>);
+
+        /// Asks for a saved connection's credentials again and keeps what is given.
+        #[qinvokable]
+        fn change_credentials(self: Pin<&mut App>, id: QString);
+
+        /// Asks for everything the destination knows about a file.
+        #[qinvokable]
+        fn describe(self: Pin<&mut App>, name: QString);
+
+        /// Asks who can read a file, answered by `shared*` and the `sharedChanged` signal.
+        #[qinvokable]
+        fn share(self: Pin<&mut App>, name: QString);
+
+        /// Changes who can read a file, then reports where it stands.
+        #[qinvokable]
+        fn reshare(self: Pin<&mut App>, name: QString, is_public: bool);
+
+        /// Signs a link to a file that works for a week without an account.
+        #[qinvokable]
+        fn sign_link(self: Pin<&mut App>, name: QString);
+
+        /// Changes a file's mode.
+        #[qinvokable]
+        fn set_permissions(self: Pin<&mut App>, name: QString, mode: i32);
 
         #[qinvokable]
         fn open(self: Pin<&mut App>, name: QString);
@@ -128,15 +187,20 @@ pub mod qobject {
 }
 
 pub struct AppRust {
+    session: i64,
+    primary: bool,
     connected: bool,
     connecting: bool,
+    connecting_to: QString,
     label: QString,
     path: QString,
+    absolute_path: QString,
     at_root: bool,
     can_rename: bool,
     can_create_folder: bool,
     rename_is_a_copy: bool,
     message: QString,
+    message_is_grave: bool,
     drag_urls: QStringList,
     moving: QStringList,
     moving_from: QString,
@@ -153,7 +217,17 @@ pub struct AppRust {
     question_accept: QString,
     question_alternative: QString,
 
-    engine: Engine,
+    can_share: bool,
+    can_set_permissions: bool,
+    shared_name: QString,
+    shared_is_public: bool,
+    shared_is_known: bool,
+    shared_why_not: QString,
+    shared_url: QString,
+    signed_url: QString,
+    facts: QStringList,
+    describing: bool,
+    expected_facts: QStringList,
 
     /// What the window is showing. Every rule about it lives in [`Screen`], where it can be
     /// tested; this object only copies the answers onto properties.
@@ -169,15 +243,20 @@ pub struct AppRust {
 impl Default for AppRust {
     fn default() -> Self {
         Self {
+            session: 0,
+            primary: false,
             connected: false,
             connecting: false,
+            connecting_to: QString::default(),
             label: QString::default(),
             path: QString::from("/"),
+            absolute_path: QString::from("/"),
             at_root: true,
             can_rename: false,
             can_create_folder: false,
             rename_is_a_copy: false,
             message: QString::default(),
+            message_is_grave: true,
             drag_urls: QStringList::default(),
             moving: QStringList::default(),
             moving_from: QString::default(),
@@ -194,30 +273,21 @@ impl Default for AppRust {
             question_accept: QString::default(),
             question_alternative: QString::default(),
 
-            engine: Engine::start(vault(), crate::bus::emitter()),
+            can_share: false,
+            can_set_permissions: false,
+            shared_name: QString::default(),
+            shared_is_public: false,
+            shared_is_known: false,
+            shared_why_not: QString::default(),
+            shared_url: QString::default(),
+            signed_url: QString::default(),
+            facts: QStringList::default(),
+            describing: false,
+            expected_facts: QStringList::default(),
+
             screen: Screen::default(),
             pending: VecDeque::new(),
         }
-    }
-}
-
-/// The desktop's keyring when one is running, and a passphrase-encrypted file when none is.
-///
-/// The choice is made once at startup rather than per connection: it is a property of the
-/// machine, and a connection that works today should not start asking differently tomorrow
-/// because a daemon happened to be slow.
-///
-/// The file is handed over locked. Opening it needs a passphrase, and the engine asks for that
-/// the first time a connection wants a credential — which is the first moment the question
-/// means anything, and the first moment there is a window to ask in.
-fn vault() -> Arc<Vault> {
-    if Keyring::is_available() {
-        return Arc::new(Vault::open(Arc::new(Keyring)));
-    }
-
-    match EncryptedFile::default_path() {
-        Some(path) => Arc::new(Vault::locked(path)),
-        None => Arc::new(Vault::open(Arc::new(InMemory::default()))),
     }
 }
 
@@ -225,12 +295,26 @@ impl cxx_qt::Initialize for qobject::App {
     fn initialize(mut self: Pin<&mut Self>) {
         let thread = self.as_mut().qt_thread();
 
+        // Kept for as long as the process runs, not for as long as the window does. A window
+        // that has been closed has had its `App` destroyed with it, and `queue` on a dead
+        // object is dropped rather than delivered — so an unsubscribe here would buy nothing
+        // and cost a listener that has to outlive whatever is holding it.
         crate::bus::listen(move |event| {
             let event = Arc::clone(event);
 
             crate::qt::queue(&thread, move |app| app.receive(event));
         })
         .forever();
+
+        // The first window is the one Camion opened with, and the only one there is when the
+        // command line is read.
+        static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        if OPENED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        self.as_mut().set_primary(true);
 
         // `camion production-web` opens that connection straight away, which is what you want
         // from a launcher, a keybinding, or a terminal you are already standing in.
@@ -249,14 +333,78 @@ impl qobject::App {
             return;
         };
 
-        self.as_mut().rust_mut().screen.connecting_to(connection.clone());
+        let attempt = Attempt::next();
+
+        self.as_mut().rust_mut().screen.connecting_to(attempt, connection.clone());
         self.as_mut().show();
-        self.rust().engine.send(Command::Connect(Box::new(connection)));
+
+        crate::running::engine().send(Command::Connect {
+            attempt,
+            connection: Box::new(connection),
+        });
     }
 
-    pub fn disconnect(mut self: Pin<&mut Self>) {
+    /// Asks for everything the destination knows about a file, for the panel showing one.
+    pub fn describe(mut self: Pin<&mut Self>, name: QString) {
+        // Cleared first: what is on screen belongs to whichever file was looked at before.
+        self.as_mut().rust_mut().screen.described = Default::default();
+        self.as_mut().rust_mut().screen.describing = true;
+
+        let name = name.to_string();
+        self.command(move |session| Command::Describe { session, name });
+    }
+
+    pub fn share(mut self: Pin<&mut Self>, name: QString) {
+        // Cleared first, so a panel opened on a second file never shows the first one's answer
+        // while the server is still being asked.
+        self.as_mut().set_shared_name(name.clone());
+        self.as_mut().set_shared_url(QString::default());
+        self.as_mut().rust_mut().screen.shared_public = None;
+        self.as_mut().rust_mut().screen.signed_url = String::new();
+
+        let name = name.to_string();
+        self.command(move |session| Command::Share { session, name });
+    }
+
+    pub fn reshare(self: Pin<&mut Self>, name: QString, is_public: bool) {
+        let name = name.to_string();
+
+        self.command(move |session| Command::Reshare { session, name, public: is_public });
+    }
+
+    pub fn set_permissions(self: Pin<&mut Self>, name: QString, mode: i32) {
+        let name = name.to_string();
+        let mode = u32::try_from(mode).unwrap_or_default() & 0o777;
+
+        self.command(move |session| Command::SetPermissions { session, name, mode });
+    }
+
+    pub fn sign_link(self: Pin<&mut Self>, name: QString) {
+        let name = name.to_string();
+
+        self.command(move |session| Command::SignLink { session, name });
+    }
+
+    /// Asked for under an attempt of its own, so the questions it puts up are asked by this
+    /// window and not by whichever one happens to be listening.
+    pub fn change_credentials(mut self: Pin<&mut Self>, id: QString) {
+        let Some(connection) = crate::store::load().find(&id.to_string()).cloned() else {
+            self.as_mut().complain(format!("there is no connection called {id}"));
+            return;
+        };
+
+        let attempt = Attempt::next();
+        self.as_mut().rust_mut().screen.attempt = Some(attempt);
+
+        crate::running::engine().send(Command::ChangeCredentials {
+            attempt,
+            connection: Box::new(connection),
+        });
+    }
+
+    pub fn disconnect(self: Pin<&mut Self>) {
         if let Some(session) = self.rust().screen.session {
-            self.as_mut().rust_mut().engine.send(Command::Disconnect(session));
+            crate::running::engine().send(Command::Disconnect(session));
         }
     }
 
@@ -391,7 +539,8 @@ impl qobject::App {
     pub fn cancel_transfer(&self, id: i64) {
         // A row with no transfer under it answers `-1`, which is not a transfer to cancel.
         if let Ok(id) = u64::try_from(id) {
-            self.rust().engine.send(Command::CancelTransfer(camion_engine::TransferId(id)));
+            crate::running::engine()
+                .send(Command::CancelTransfer(camion_engine::TransferId(id)));
         }
     }
 
@@ -462,12 +611,12 @@ impl qobject::App {
     /// interface could have asked for, so there is nothing to report either.
     fn command(&self, build: impl FnOnce(SessionId) -> Command) {
         if let Some(session) = self.rust().screen.session {
-            self.rust().engine.send(build(session));
+            crate::running::engine().send(build(session));
         }
     }
 
     fn complain(mut self: Pin<&mut Self>, message: impl std::fmt::Display) {
-        self.as_mut().rust_mut().screen.message = message.to_string();
+        self.as_mut().rust_mut().screen.complain(message);
         self.show();
     }
 
@@ -475,9 +624,29 @@ impl qobject::App {
         self.as_mut().rust_mut().screen.receive(&event);
         self.as_mut().show();
 
-        if let Event::Ask(_) = event.as_ref() {
+        if let Event::Ask(prompt) = event.as_ref()
+            && self.ours(prompt.concern)
+        {
             self.as_mut().rust_mut().pending.push_back(Arc::clone(&event));
             self.ask_the_next_question();
+        }
+    }
+
+    /// Whether a question is this window's to ask.
+    ///
+    /// Stricter than what [`Screen`] shows, and deliberately so: a message in two windows is
+    /// repetition, but a question in two windows is one of them left holding a dialog about
+    /// something the other has already answered. A question belonging to no connection is the
+    /// first window's, because somebody has to ask it and exactly one of them may.
+    fn ours(&self, concern: camion_engine::Concern) -> bool {
+        match concern {
+            camion_engine::Concern::Everyone => self.rust().primary,
+            camion_engine::Concern::Attempt(attempt) => {
+                self.rust().screen.attempt == Some(attempt)
+            }
+            camion_engine::Concern::Session(session) => {
+                self.rust().screen.session == Some(session)
+            }
         }
     }
 
@@ -488,21 +657,62 @@ impl qobject::App {
     fn show(mut self: Pin<&mut Self>) {
         let screen = &self.rust().screen;
 
+        // Zero for no connection. The file list binds to this, and a list still showing the
+        // session it had is a list drawing another window's folder.
+        let session = screen.session.map(|it| it.0 as i64).unwrap_or_default();
         let (connecting, connected) = (screen.connecting, screen.connected);
+        let connecting_to = screen.connecting_id();
         let (label, message) = (screen.label.clone(), screen.message.clone());
+        let grave = screen.message_is_grave;
         let (can_rename, is_a_copy) = (screen.can_rename, screen.rename_is_a_copy);
         let can_create_folder = screen.can_create_folder;
         let (path, at_root) = (screen.path(), screen.at_root());
+        let absolute = screen.absolute_path();
+        let can_share = screen.can_share;
+        let can_set_permissions = screen.can_set_permissions;
+        let (shared_public, shared_url) = (screen.shared_public, screen.shared_url.clone());
+        let shared_why_not = screen.shared_why_not.clone();
+        let signed_url = screen.signed_url.clone();
 
+        // Label and value alternating, because a list of pairs is the one shape that survives
+        // the trip into QML without inventing a type for it.
+        let describing = screen.describing;
+        let expected = screen
+            .expected()
+            .into_iter()
+            .map(QString::from)
+            .collect::<QStringList>();
+
+        let facts = screen
+            .described
+            .rows()
+            .iter()
+            .flat_map(|(label, said)| [QString::from(*label), QString::from(said)])
+            .collect::<QStringList>();
+
+        self.as_mut().set_session(session);
         self.as_mut().set_connecting(connecting);
+        self.as_mut().set_connecting_to(QString::from(&connecting_to));
         self.as_mut().set_connected(connected);
         self.as_mut().set_label(QString::from(&label));
         self.as_mut().set_can_rename(can_rename);
         self.as_mut().set_rename_is_a_copy(is_a_copy);
         self.as_mut().set_can_create_folder(can_create_folder);
         self.as_mut().set_path(QString::from(&path));
+        self.as_mut().set_absolute_path(QString::from(&absolute));
         self.as_mut().set_at_root(at_root);
         self.as_mut().set_message(QString::from(&message));
+        self.as_mut().set_message_is_grave(grave);
+        self.as_mut().set_can_share(can_share);
+        self.as_mut().set_can_set_permissions(can_set_permissions);
+        self.as_mut().set_shared_is_public(shared_public.unwrap_or_default());
+        self.as_mut().set_shared_is_known(shared_public.is_some());
+        self.as_mut().set_shared_why_not(QString::from(&shared_why_not));
+        self.as_mut().set_shared_url(QString::from(&shared_url));
+        self.as_mut().set_signed_url(QString::from(&signed_url));
+        self.as_mut().set_facts(facts);
+        self.as_mut().set_describing(describing);
+        self.as_mut().set_expected_facts(expected);
     }
 
     /// Turns a question from the engine into the words the dialog shows.

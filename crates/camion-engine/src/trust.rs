@@ -1,24 +1,29 @@
 use async_trait::async_trait;
 use camion_providers::{HostKey, HostTrust, Trust};
 
-use crate::event::{Event, Prompt, Question};
+use crate::event::{Concern, Event, Prompt, Question};
 use crate::known_hosts::{KnownHosts, Verdict};
 use crate::Emitter;
 
 /// Answers "is this the server we meant?" by consulting `known_hosts` first and the person at
 /// the keyboard second.
+///
+/// Built per attempt at connecting rather than once for the application, because everything it
+/// says is about that one connection — and with two windows open, a fingerprint shown in the
+/// wrong one is a fingerprint nobody can check.
 pub struct PromptingTrust {
     known_hosts: KnownHosts,
     emit: Emitter,
+    concern: Concern,
 }
 
 impl PromptingTrust {
-    pub fn new(known_hosts: KnownHosts, emit: Emitter) -> Self {
-        Self { known_hosts, emit }
+    pub fn new(known_hosts: KnownHosts, emit: Emitter, concern: Concern) -> Self {
+        Self { known_hosts, emit, concern }
     }
 
     async fn ask(&self, question: Question) -> bool {
-        let (prompt, answer) = Prompt::new(question);
+        let (prompt, answer) = Prompt::new(self.concern, question);
         (self.emit)(Event::Ask(prompt));
 
         answer.await.map(|answer| answer.is_accepted()).unwrap_or(false)
@@ -35,6 +40,7 @@ impl HostTrust for PromptingTrust {
             // that cannot be read. Refusing is the only honest answer.
             Err(error) => {
                 (self.emit)(Event::Failed {
+                    concern: self.concern,
                     message: format!("known_hosts could not be read, so {} cannot be verified: {error}", key.host),
                 });
 
@@ -61,6 +67,7 @@ impl HostTrust for PromptingTrust {
                     // again next time — which is worth saying rather than looking like a bug.
                     if let Err(error) = self.known_hosts.remember(key) {
                         (self.emit)(Event::Failed {
+                            concern: self.concern,
                             message: format!("{} was trusted, but could not be written to known_hosts: {error}", key.host),
                         });
                     }
@@ -134,7 +141,7 @@ mod tests {
             }
         });
 
-        let trust = PromptingTrust::new(KnownHosts::new(path), emit);
+        let trust = PromptingTrust::new(KnownHosts::new(path), emit, Concern::Everyone);
 
         assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Known);
         assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
@@ -145,7 +152,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("known_hosts");
 
-        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept));
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept), Concern::Everyone);
 
         assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Accepted);
         assert_eq!(KnownHosts::new(&path).verdict(&host_key(KEY)).unwrap(), Verdict::Known);
@@ -156,7 +163,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("known_hosts");
 
-        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Decline));
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Decline), Concern::Everyone);
 
         assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Rejected);
         assert!(!path.exists());
@@ -169,7 +176,7 @@ mod tests {
         std::fs::write(&path, format!("example.com {KEY}\n")).unwrap();
 
         let different = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDifferentKeyData00000000000000000";
-        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept));
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept), Concern::Everyone);
 
         assert_eq!(trust.verify(&host_key(different)).await, Trust::Accepted);
         assert_eq!(
@@ -183,7 +190,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let emit: Emitter = Arc::new(|_event| {});
 
-        let trust = PromptingTrust::new(KnownHosts::new(directory.path().join("known_hosts")), emit);
+        let trust = PromptingTrust::new(
+            KnownHosts::new(directory.path().join("known_hosts")),
+            emit,
+            Concern::Everyone,
+        );
 
         assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Rejected);
     }

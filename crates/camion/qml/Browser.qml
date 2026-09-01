@@ -11,6 +11,11 @@ import io.camion
 FocusScope {
     id: browser
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     required property var files
 
     signal renameRequested(string name)
@@ -37,7 +42,7 @@ FocusScope {
             return
         }
 
-        App.beginMove(selectedNames())
+        app.beginMove(selectedNames())
 
         // Setting this is what starts the drag. `startDrag()` is for a drag that is already
         // going, which this is not.
@@ -69,14 +74,14 @@ FocusScope {
         // item, which is a single pixel and looks like nothing at all.
         Drag.imageSource: browser.files.iconAt(selection.current)
         // Qt clears this when the drag finishes, which is after any drop has been delivered.
-        Drag.onActiveChanged: if (!dragSource.Drag.active) App.endMove()
+        Drag.onActiveChanged: if (!dragSource.Drag.active) app.endMove()
 
-        Drag.mimeData: App.dragUrls.length > 0
+        Drag.mimeData: app.dragUrls.length > 0
             ? ({
-                "application/x-camion-move": App.moving.join("\n"),
-                "text/uri-list": App.dragUrls.join("\r\n")
+                "application/x-camion-move": app.moving.join("\n"),
+                "text/uri-list": app.dragUrls.join("\r\n")
             })
-            : ({ "application/x-camion-move": App.moving.join("\n") })
+            : ({ "application/x-camion-move": app.moving.join("\n") })
     }
 
 
@@ -88,9 +93,21 @@ FocusScope {
         return names
     }
 
+    /// What double-clicking, or pressing Enter, means.
+    ///
+    /// A folder opens. A file cannot — there is nothing on this machine to open, and fetching
+    /// it silently would be a download nobody asked for — so it shows what is known about it
+    /// and offers to bring it down.
     function openRow(row) {
-        if (row >= 0 && browser.files.isFolderAt(row)) {
-            App.open(browser.files.nameAt(row))
+        if (row < 0) {
+            return
+        }
+
+        if (browser.files.isFolderAt(row)) {
+            app.open(browser.files.nameAt(row))
+        } else {
+            selection.selectOnly(row)
+            fileDetails.show(browser.files.details(row))
         }
     }
 
@@ -170,8 +187,9 @@ FocusScope {
             /// after opening a folder to put something in.
             SpringLoaded {
                 id: hereTarget
+                app: browser.app
                 anchors.fill: parent
-                folder: App.path
+                folder: app.path
                 opens: false
             }
 
@@ -187,6 +205,7 @@ FocusScope {
 
             Rows {
                 id: listView
+                app: browser.app
                 anchors.fill: parent
                 visible: !Display.isGrid
                 enabled: visible
@@ -196,6 +215,7 @@ FocusScope {
 
             Grid {
                 id: gridView
+                app: browser.app
                 anchors.fill: parent
                 visible: Display.isGrid
                 enabled: visible
@@ -306,6 +326,29 @@ FocusScope {
                 onDoubleClicked: click => browser.openRow(rowAt(click.x, click.y))
             }
 
+            /// Waiting, where whoever is waiting is looking.
+            ///
+            /// A listing can take seconds on a slow server, and an empty window with a small
+            /// mark turning in the corner reads as a folder with nothing in it.
+            Column {
+                anchors.centerIn: parent
+                spacing: 12
+                visible: browser.files.working && browser.files.count === 0
+
+                Spinner {
+                    running: parent.visible
+                    implicitWidth: 28
+                    implicitHeight: 28
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
+
+                Text {
+                    text: "Loading…"
+                    color: Theme.muted
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
+            }
+
             Text {
                 anchors.centerIn: parent
                 visible: browser.files.count === 0 && !browser.files.working
@@ -323,7 +366,7 @@ FocusScope {
                 browser.openRow(selection.current)
                 break
             case Qt.Key_Backspace:
-                App.up()
+                app.up()
                 break
             case Qt.Key_Up:
                 browser.moveBy(-browser.perLine())
@@ -341,7 +384,7 @@ FocusScope {
                 browser.confirmDelete()
                 break
             case Qt.Key_F2:
-                if (selection.current >= 0 && App.canRename) {
+                if (selection.current >= 0 && app.canRename) {
                     browser.renameRequested(browser.files.nameAt(selection.current))
                 }
                 break
@@ -375,18 +418,18 @@ FocusScope {
 
         Shortcut {
             sequences: [StandardKey.Refresh]
-            onActivated: App.refresh()
+            onActivated: app.refresh()
         }
 
         Shortcut {
             sequence: "Alt+Up"
-            onActivated: App.up()
+            onActivated: app.up()
         }
 
         Shortcut {
             sequence: "Ctrl+N"
             onActivated: {
-                if (App.canCreateFolder) {
+                if (app.canCreateFolder) {
                     browser.newFolderRequested()
                 }
             }
@@ -394,12 +437,12 @@ FocusScope {
 
         Shortcut {
             sequence: "Ctrl+X"
-            onActivated: App.beginMove(browser.selectedNames())
+            onActivated: app.beginMove(browser.selectedNames())
         }
 
         Shortcut {
             sequence: "Ctrl+V"
-            onActivated: App.moveInto(App.path)
+            onActivated: app.moveInto(app.path)
         }
 
         Shortcut {
@@ -419,6 +462,7 @@ FocusScope {
 
         FileMenu {
             id: menu
+            app: browser.app
 
             onOpenRequested: browser.openRow(selection.current)
             onDownloadRequested: destination.open()
@@ -427,22 +471,28 @@ FocusScope {
             onNewFolderRequested: browser.newFolderRequested()
         }
 
+        FileDetails {
+            id: fileDetails
+            app: browser.app
+            onDownloadRequested: destination.open()
+        }
+
         FolderDialog {
             id: destination
             title: "Download to"
-            onAccepted: App.download(browser.selectedNames(), selectedFolder)
+            onAccepted: app.download(browser.selectedNames(), selectedFolder)
         }
 
         Confirm {
             id: confirmation
-            onConfirmed: App.remove(browser.selectedNames())
+            onConfirmed: app.remove(browser.selectedNames())
         }
 
         DropArea {
             anchors.fill: parent
             keys: ["text/uri-list"]
 
-            onDropped: drop => App.dropUrls(drop.urls)
+            onDropped: drop => app.dropUrls(drop.urls)
 
             Rectangle {
                 anchors.fill: parent

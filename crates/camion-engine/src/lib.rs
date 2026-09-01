@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub use config::{Connection, Connections};
 pub use engine::{Command, Engine};
 pub use error::{Error, Result};
-pub use event::{Answer, Event, Outcome, Prompt, Question};
+pub use event::{Answer, Attempt, Concern, Event, Outcome, Prompt, Question};
 pub use known_hosts::{KnownHosts, Verdict};
 pub use secrets::{SecretStore, Vault};
 pub use session::SessionId;

@@ -6,6 +6,11 @@ import io.camion
 Flickable {
     id: trail
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     property var crumbs: []
 
     implicitHeight: 28
@@ -14,14 +19,14 @@ Flickable {
     clip: true
 
     function reload() {
-        crumbs = App.breadcrumb()
+        crumbs = app.breadcrumb()
         contentX = Math.max(0, row.width - width)
     }
 
     Component.onCompleted: reload()
 
     Connections {
-        target: App
+        target: trail.app
         function onPathChanged() { trail.reload() }
     }
 
@@ -51,10 +56,10 @@ Flickable {
                     FlatButton {
                         id: crumb
                         // The root has no name of its own, so it is shown as the connection.
-                        text: index === 0 ? App.label : modelData.split("/").pop()
+                        text: index === 0 ? trail.app.label : modelData.split("/").pop()
                         enabled: index < trail.crumbs.length - 1
                         highlighted: here.containsDrag
-                        onClicked: App.openPath(modelData)
+                        onClicked: trail.app.openPath(modelData)
                     }
 
                     /// Dropping onto a crumb is how something goes back up, and holding over one
@@ -62,9 +67,10 @@ Flickable {
                     /// without ever being let go of.
                     SpringLoaded {
                         id: here
+                        app: trail.app
                         anchors.fill: parent
                         folder: modelData
-                        enabled: modelData !== App.path
+                        enabled: modelData !== trail.app.path
                     }
                 }
             }

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Permissions, Provider, RemotePath, Result,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Linking, Owning, Ownership, Permissions,
+    Permitting, Provider, RemotePath, Result,
 };
 use russh::client;
 use russh_sftp::client::SftpSession;
@@ -97,6 +98,62 @@ impl SftpProvider {
 }
 
 #[async_trait]
+impl Owning for SftpProvider {
+    /// The name when the server gives one, the number when it does not. A `uid` is still an
+    /// answer, and a blank row where the owner should be is not.
+    async fn ownership(&self, path: &RemotePath) -> Result<Ownership> {
+        let attributes = self
+            .sftp
+            .metadata(self.absolute(path))
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        Ok(Ownership {
+            user: attributes.user.or_else(|| attributes.uid.map(|uid| uid.to_string())),
+            group: attributes.group.or_else(|| attributes.gid.map(|gid| gid.to_string())),
+        })
+    }
+}
+
+#[async_trait]
+impl Linking for SftpProvider {
+    async fn link_target(&self, path: &RemotePath) -> Result<Option<String>> {
+        let absolute = self.absolute(path);
+
+        // Asked of the link itself rather than of what it points at, which is the only way to
+        // find out that it is a link at all.
+        let attributes = self
+            .sftp
+            .symlink_metadata(absolute.clone())
+            .await
+            .map_err(|error| translate(error, path))?;
+
+        if !attributes.is_symlink() {
+            return Ok(None);
+        }
+
+        Ok(self.sftp.read_link(absolute).await.ok())
+    }
+}
+
+#[async_trait]
+impl Permitting for SftpProvider {
+    async fn set_permissions(&self, path: &RemotePath, permissions: Permissions) -> Result<()> {
+        // Only the mode is sent. `FileAttributes` also carries the owner and the times, and a
+        // default one would ask the server to set those to nothing.
+        let attributes = russh_sftp::protocol::FileAttributes {
+            permissions: Some(permissions.mode()),
+            ..Default::default()
+        };
+
+        self.sftp
+            .set_metadata(self.absolute(path), attributes)
+            .await
+            .map_err(|error| translate(error, path))
+    }
+}
+
+#[async_trait]
 impl Provider for SftpProvider {
     fn label(&self) -> String {
         self.label.clone()
@@ -104,6 +161,18 @@ impl Provider for SftpProvider {
 
     fn home(&self) -> String {
         self.home.clone()
+    }
+
+    fn owning(&self) -> Option<&dyn Owning> {
+        Some(self)
+    }
+
+    fn linking(&self) -> Option<&dyn Linking> {
+        Some(self)
+    }
+
+    fn permitting(&self) -> Option<&dyn Permitting> {
+        Some(self)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -164,7 +233,7 @@ impl Provider for SftpProvider {
         }
 
         let chunks = futures::StreamExt::map(
-            tokio_util::io::ReaderStream::new(file.take(length)),
+            tokio_util::io::ReaderStream::with_capacity(file.take(length), READ_CHUNK),
             |chunk| chunk.map_err(|error| Error::caused_by("the download was interrupted", error)),
         );
 
@@ -181,15 +250,20 @@ impl Provider for SftpProvider {
             .await
             .map_err(|error| translate(error, path))?;
 
-        let mut reader = tokio_util::io::StreamReader::new(
-            futures::StreamExt::map(body, |chunk| {
-                chunk.map_err(|error| std::io::Error::other(error.to_string()))
-            }),
-        );
+        // Written straight from the stream rather than through `tokio::io::copy`, whose own
+        // buffer is eight kilobytes: every write would be that size no matter how much had
+        // been read. The SFTP client sends up to eight writes without waiting for the replies,
+        // so the size of each one is what decides whether a link is filled or a round trip is
+        // paid for every eight kilobytes.
+        let mut body = body;
 
-        tokio::io::copy(&mut reader, &mut file)
-            .await
-            .map_err(|error| Error::caused_by("the upload was interrupted", error))?;
+        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+            let chunk = chunk?;
+
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| Error::caused_by("the upload was interrupted", error))?;
+        }
 
         file.shutdown()
             .await
@@ -301,6 +375,12 @@ async fn authenticate(
         )))
     }
 }
+
+/// How much is asked for or handed over at a time.
+///
+/// Matches the SFTP client's own maximum packet, so a read or a write becomes one request
+/// rather than being cut up into several.
+const READ_CHUNK: usize = 256 * 1024;
 
 /// Signs in the way `ssh` would: the agent first, then the usual key files.
 ///

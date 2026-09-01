@@ -126,6 +126,7 @@ impl Settings {
             // forgetting it every time the application starts is the kind of thing people
             // spend an afternoon on before finding out the directory is not writable.
             crate::bus::publish(camion_engine::Event::Failed {
+                concern: camion_engine::Concern::Everyone,
                 message: format!("your display settings could not be saved: {reason}"),
             });
         }

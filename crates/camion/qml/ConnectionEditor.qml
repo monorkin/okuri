@@ -10,6 +10,11 @@ import io.camion
 Dialog {
     id: editor
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     property string editingId: ""
 
     modal: true
@@ -42,6 +47,7 @@ Dialog {
 
     function compose() {
         editingId = ""
+        credentialsCanChange = false
         name.text = ""
         host.text = ""
         port.text = ""
@@ -57,6 +63,10 @@ Dialog {
         name.forceActiveFocus()
     }
 
+    /// Whether this connection signs in with anything worth replacing. Read when the editor
+    /// opens rather than bound, because it is about what is saved, not what is being typed.
+    property bool credentialsCanChange: false
+
     /// Opens the editor on a connection that already exists, showing what it holds. Opening
     /// blank and saving would quietly replace the whole thing with an empty one.
     function amend(id) {
@@ -69,6 +79,7 @@ Dialog {
         }
 
         editingId = saved.id
+        credentialsCanChange = ConnectionList.needsCredentials(saved.id)
         name.text = saved.name || ""
         host.text = saved.host || ""
         port.text = saved.port || ""
@@ -230,6 +241,17 @@ Dialog {
             spacing: 8
             anchors.right: parent.right
             anchors.rightMargin: 20
+
+            /// Connecting only asks for a credential when none is saved, so without this a
+            /// mistyped access key could only be corrected from the desktop's keyring.
+            FlatButton {
+                text: "Change credentials"
+                visible: editor.editingId !== "" && editor.credentialsCanChange
+                onClicked: {
+                    app.changeCredentials(editor.editingId)
+                    editor.visible = false
+                }
+            }
 
             FlatButton {
                 text: "Delete"

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    Served, Serving,
 };
 use futures::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -134,6 +135,35 @@ impl WebDavProvider {
 }
 
 #[async_trait]
+impl Serving for WebDavProvider {
+    /// Whatever the web server chose to serve the file as, which is all WebDAV has to say.
+    async fn served(&self, path: &RemotePath) -> Result<Served> {
+        let response = self
+            .request(Method::HEAD, &self.url(path))
+            .send()
+            .await
+            .map_err(|error| Error::caused_by("could not read the file's details", error))?;
+
+        expect_success(response.status(), path, "read the file's details")?;
+
+        let said = |header: &str| {
+            response
+                .headers()
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        Ok(Served {
+            content_type: said("content-type"),
+            etag: said("etag").map(|tag| tag.trim_matches('"').to_owned()),
+            cache_control: said("cache-control"),
+            content_encoding: said("content-encoding"),
+        })
+    }
+}
+
+#[async_trait]
 impl Provider for WebDavProvider {
     fn label(&self) -> String {
         self.label.clone()
@@ -154,6 +184,10 @@ impl Provider for WebDavProvider {
             .filter(|found| !found.is_same_place_as(&here))
             .filter_map(|found| found.into_entry())
             .collect())
+    }
+
+    fn serving(&self) -> Option<&dyn Serving> {
+        Some(self)
     }
 
     async fn stat(&self, path: &RemotePath) -> Result<Entry> {
@@ -202,8 +236,20 @@ impl Provider for WebDavProvider {
 
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
         // Streamed rather than collected: a large file never has to fit in memory.
-        let response = self
-            .request(Method::PUT, &self.url(path))
+        let mut request = self.request(Method::PUT, &self.url(path));
+
+        // Said when it is known. Without it the upload goes up chunked, which some servers
+        // refuse outright and others accept only by spooling the whole thing to disk first.
+        if let Some(size) = body.size() {
+            request = request.header(reqwest::header::CONTENT_LENGTH, size);
+        }
+
+        // And what it is, which is what the server will serve it back as.
+        if let Some(media) = path.name().and_then(media_type) {
+            request = request.header(reqwest::header::CONTENT_TYPE, media);
+        }
+
+        let response = request
             .body(reqwest::Body::wrap_stream(body))
             .send()
             .await

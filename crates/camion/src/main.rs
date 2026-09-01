@@ -10,6 +10,7 @@ mod icons;
 mod kinds;
 mod palette;
 mod qt;
+mod running;
 mod screen;
 mod store;
 mod theme;
@@ -32,7 +33,7 @@ fn main() {
     engine
         .as_mut()
         .expect("a QML engine")
-        .load(&QUrl::from("qrc:/qt/qml/io/camion/qml/Main.qml"));
+        .load(&QUrl::from("qrc:/qt/qml/io/camion/qml/Camion.qml"));
 
     app.as_mut().expect("a Qt application").exec();
 }

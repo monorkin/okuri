@@ -20,9 +20,33 @@ impl EntryKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Permissions(pub u32);
 
+/// Whose permissions are being asked about. The values are the shift, in threes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    Everyone = 0,
+    Group = 1,
+    Owner = 2,
+}
+
+/// What may be done. The values are the bits, as every Unix has written them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Execute = 0b001,
+    Write = 0b010,
+    Read = 0b100,
+}
+
 impl Permissions {
     pub fn mode(&self) -> u32 {
         self.0 & 0o7777
+    }
+
+    /// Whether `who` may do `what`, for showing the mode as something other than nine
+    /// characters of shorthand.
+    pub fn allows(&self, who: Who, what: Access) -> bool {
+        let bits = (self.mode() >> (who as u32 * 3)) & 0b111;
+
+        bits & what as u32 != 0
     }
 
     /// The `rwxr-xr-x` form, which is what the list column shows.
@@ -115,15 +139,23 @@ impl Sort {
     }
 
     pub fn apply(&self, entries: &mut [Entry]) {
-        entries.sort_by(|left, right| {
-            let mut within_kind = self.compare(left, right);
+        entries.sort_by(|left, right| self.order(left, right));
+    }
 
-            if self.descending {
-                within_kind = within_kind.reverse();
-            }
+    /// The same sort over anything that can be read as an entry, so a list of shared handles
+    /// can be ordered without copying what they point at.
+    pub fn apply_to<T: std::borrow::Borrow<Entry>>(&self, entries: &mut [T]) {
+        entries.sort_by(|left, right| self.order(left.borrow(), right.borrow()));
+    }
 
-            left.kind.cmp(&right.kind).then(within_kind)
-        });
+    fn order(&self, left: &Entry, right: &Entry) -> std::cmp::Ordering {
+        let mut within_kind = self.compare(left, right);
+
+        if self.descending {
+            within_kind = within_kind.reverse();
+        }
+
+        left.kind.cmp(&right.kind).then(within_kind)
     }
 
     fn compare(&self, left: &Entry, right: &Entry) -> std::cmp::Ordering {
@@ -197,6 +229,24 @@ fn take_number(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u12
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mode_says_who_may_do_what() {
+        // rw-r-----
+        let permissions = Permissions(0o640);
+
+        assert!(permissions.allows(Who::Owner, Access::Read));
+        assert!(permissions.allows(Who::Owner, Access::Write));
+        assert!(!permissions.allows(Who::Owner, Access::Execute));
+
+        assert!(permissions.allows(Who::Group, Access::Read));
+        assert!(!permissions.allows(Who::Group, Access::Write));
+
+        assert!(!permissions.allows(Who::Everyone, Access::Read));
+
+        // And agrees with the shorthand the list column shows.
+        assert_eq!(permissions.to_symbolic(), "rw-r-----");
+    }
 
     #[test]
     fn permissions_render_symbolically() {

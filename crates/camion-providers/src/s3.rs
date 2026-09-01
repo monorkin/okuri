@@ -4,12 +4,17 @@ use std::time::Duration;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream as AwsStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, Delete, ObjectCannedAcl, ObjectIdentifier, Permission,
+};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    Served, Serving, Sharing, Stored, Storing, Visibility,
 };
 use futures::StreamExt;
 use time::OffsetDateTime;
@@ -29,6 +34,10 @@ pub struct S3Provider {
     bucket: String,
     root: String,
     client: Client,
+    /// Where the bucket answers, for writing down an address somebody else can open. Kept as
+    /// the connection resolved it, because a preset and a self-hosted store disagree about
+    /// what the host even is.
+    endpoint: String,
 }
 
 /// Anything smaller goes up in one request; anything larger is split into parts of this size.
@@ -48,6 +57,7 @@ impl S3Provider {
         })?;
 
         let region = config.preset.signing_region(&config.region);
+        let region_for_urls = region.clone();
         let mut builder = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(region))
@@ -56,10 +66,14 @@ impl S3Provider {
             // looking at a window cannot: a wrong endpoint should say so in seconds rather
             // than retrying quietly for a minute first.
             .retry_config(RetryConfig::standard().with_max_attempts(2))
+            // Only the connecting is given a deadline. A deadline on the whole attempt would
+            // apply to uploads too, and an eight-megabyte part cannot cross a slow domestic
+            // uplink in thirty seconds — every part would time out, retry, and fail. What that
+            // deadline was for is a wrong endpoint saying so quickly, which is what a connect
+            // timeout is.
             .timeout_config(
                 TimeoutConfig::builder()
                     .connect_timeout(Duration::from_secs(5))
-                    .operation_attempt_timeout(Duration::from_secs(30))
                     .build(),
             );
 
@@ -74,6 +88,9 @@ impl S3Provider {
             label: format!("{} · {}", config.preset.label(), config.bucket),
             bucket: config.bucket.clone(),
             root: normalize_root(&config.root),
+            endpoint: config
+                .resolved_endpoint()
+                .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", region_for_urls)),
             client: Client::from_conf(builder.build()),
         };
 
@@ -82,6 +99,20 @@ impl S3Provider {
         provider.list(&RemotePath::root()).await?;
 
         Ok(provider)
+    }
+
+    /// One `HEAD`, which is where every answer about a single object comes from.
+    async fn head(
+        &self,
+        path: &RemotePath,
+    ) -> Result<aws_sdk_s3::operation::head_object::HeadObjectOutput> {
+        self.client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .send()
+            .await
+            .map_err(|error| missing_or_refused(error, path))
     }
 
     /// The key a path corresponds to, with the connection's root prefix in front of it.
@@ -134,14 +165,14 @@ impl S3Provider {
                     ObjectIdentifier::builder()
                         .key(key)
                         .build()
-                        .map_err(|error| failed(format!("could not name {key}"), error))
+                        .map_err(|error| Error::caused_by(format!("could not name {key}"), error))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
             let delete = Delete::builder()
                 .set_objects(Some(objects))
                 .build()
-                .map_err(|error| failed("could not list what to delete", error))?;
+                .map_err(|error| Error::caused_by("could not list what to delete", error))?;
 
             self.client
                 .delete_objects()
@@ -155,12 +186,18 @@ impl S3Provider {
         Ok(())
     }
 
-    async fn upload_in_parts(&self, key: &str, mut body: ByteStream) -> Result<()> {
+    async fn upload_in_parts(
+        &self,
+        key: &str,
+        media: Option<&str>,
+        mut body: ByteStream,
+    ) -> Result<()> {
         let started = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .set_content_type(media.map(str::to_owned))
             .send()
             .await
             .map_err(|error| failed("could not begin the upload", error))?;
@@ -169,29 +206,31 @@ impl S3Provider {
             return Err(Error::provider("the server did not accept a multipart upload"));
         };
 
-        let mut parts = Vec::new();
+        // Several parts at once. A part number says where a part belongs, so they need not
+        // arrive in order — and waiting for each one before reading the next leaves the link
+        // idle for exactly as long as reading takes.
+        let sent = crate::parts::each_part(&mut body, PART_SIZE, |index, bytes| {
+            self.upload_part(key, upload_id, index as i32 + 1, bytes.into())
+        })
+        .await;
 
-        while let Some(bytes) = crate::parts::next_part(&mut body, PART_SIZE).await? {
-            let number = parts.len() as i32 + 1;
+        let parts = match sent {
+            Ok(parts) => parts,
+            Err(error) => {
+                // Leaving the parts behind would quietly cost money for as long as the bucket
+                // lives, so a failed upload cleans up after itself.
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
 
-            match self.upload_part(key, upload_id, number, bytes.into()).await {
-                Ok(part) => parts.push(part),
-                Err(error) => {
-                    // Leaving the parts behind would quietly cost money for as long as the
-                    // bucket lives, so a failed upload cleans up after itself.
-                    let _ = self
-                        .client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .upload_id(upload_id)
-                        .send()
-                        .await;
-
-                    return Err(error);
-                }
+                return Err(error);
             }
-        }
+        };
 
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
@@ -257,9 +296,162 @@ impl S3Provider {
 }
 
 #[async_trait]
+impl Serving for S3Provider {
+    async fn served(&self, path: &RemotePath) -> Result<Served> {
+        let head = self.head(path).await?;
+
+        Ok(Served {
+            content_type: head.content_type().map(str::to_owned),
+            // The quotes are the protocol's, not part of the value.
+            etag: head.e_tag().map(|tag| tag.trim_matches('"').to_owned()),
+            cache_control: head.cache_control().map(str::to_owned),
+            content_encoding: head.content_encoding().map(str::to_owned),
+        })
+    }
+}
+
+#[async_trait]
+impl Storing for S3Provider {
+    async fn stored(&self, path: &RemotePath) -> Result<Stored> {
+        let head = self.head(path).await?;
+
+        Ok(Stored {
+            // A store names the class only when it is not the ordinary one — the protocol says
+            // so, and both R2 and MinIO leave it out entirely. Saying nothing would show no row
+            // at all for a file that plainly is stored somehow.
+            class: Some(
+                head.storage_class()
+                    .map(|class| class.as_str().to_owned())
+                    .unwrap_or_else(|| "STANDARD".to_owned()),
+            ),
+            encryption: head
+                .server_side_encryption()
+                .map(|kind| kind.as_str().to_owned()),
+            version: head.version_id().map(str::to_owned),
+        })
+    }
+}
+
+#[async_trait]
+impl Sharing for S3Provider {
+    /// Reads the object's access control list and looks for the grant that means "anyone".
+    ///
+    /// Buckets can also be opened up by a bucket policy, which this cannot see — a file may
+    /// therefore read as private and still be reachable. Reporting what we can actually check
+    /// is better than guessing, and the address below is there to be tried either way.
+    async fn visibility(&self, path: &RemotePath) -> Result<Visibility> {
+        let acl = self
+            .client
+            .get_object_acl()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .send()
+            .await
+            .map_err(|error| missing_or_refused(error, path))?;
+
+        let public = acl.grants().iter().any(|grant| {
+            let everyone = grant
+                .grantee()
+                .and_then(|grantee| grantee.uri())
+                .is_some_and(|uri| uri.ends_with("/groups/global/AllUsers"));
+
+            everyone
+                && matches!(
+                    grant.permission(),
+                    Some(Permission::Read) | Some(Permission::FullControl)
+                )
+        });
+
+        match public {
+            true => Ok(Visibility::Public),
+            false => Ok(Visibility::Private),
+        }
+    }
+
+    async fn set_visibility(&self, path: &RemotePath, visibility: Visibility) -> Result<()> {
+        let acl = match visibility {
+            Visibility::Public => ObjectCannedAcl::PublicRead,
+            Visibility::Private => ObjectCannedAcl::Private,
+        };
+
+        self.client
+            .put_object_acl()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .acl(acl)
+            .send()
+            .await
+            .map_err(|error| refused_to_share(error, path))?;
+
+        Ok(())
+    }
+
+    async fn temporary_url(&self, path: &RemotePath, valid_for: Duration) -> Result<String> {
+        let signing = PresigningConfig::expires_in(valid_for)
+            .map_err(|error| Error::caused_by("that is too long to sign a link for", error))?;
+
+        let signed = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .presigned(signing)
+            .await
+            .map_err(|error| failed("could not sign a link", error))?;
+
+        Ok(signed.uri().to_owned())
+    }
+
+    /// Built rather than asked for: the address of an object is its endpoint, its bucket and
+    /// its key, and every one of those is already known here.
+    fn public_url(&self, path: &RemotePath) -> String {
+        const IN_KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'.')
+            .remove(b'_')
+            .remove(b'~')
+            .remove(b'/');
+
+        let key = self.key(path);
+        let key = percent_encoding::utf8_percent_encode(&key, IN_KEY);
+
+        format!("{}/{}/{key}", self.endpoint.trim_end_matches('/'), self.bucket)
+    }
+}
+
+/// A store that will not talk about access control at all, said in words that name the cause.
+///
+/// Buckets created since 2023 have object ACLs turned off by default, and Cloudflare R2 never
+/// had them: on both, the answer is a bucket-wide setting rather than anything about this file.
+/// Without this the failure reads as a permissions problem with the file itself.
+fn refused_to_share<E: ProvideErrorMetadata>(error: E, path: &RemotePath) -> Error {
+    match error.code() {
+        Some("AccessControlListNotSupported" | "NotImplemented" | "InvalidRequest") => {
+            Error::provider(format!(
+                "{path} cannot be shared per file: this store decides who can read a bucket, \
+                 not who can read the files in it"
+            ))
+        }
+        _ => failed("could not change who can read this", error),
+    }
+}
+
+#[async_trait]
 impl Provider for S3Provider {
     fn label(&self) -> String {
         self.label.clone()
+    }
+
+    fn serving(&self) -> Option<&dyn Serving> {
+        Some(self)
+    }
+
+    fn storing(&self) -> Option<&dyn Storing> {
+        Some(self)
+    }
+
+    fn sharing(&self) -> Option<&dyn Sharing> {
+        Some(self)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -365,6 +557,11 @@ impl Provider for S3Provider {
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
         let key = self.key(path);
 
+        // Said at upload time, because it cannot be said later without rewriting the object —
+        // and a store told nothing answers `application/octet-stream` to everybody, which is
+        // the difference between a browser showing an image and downloading it.
+        let media = path.name().and_then(media_type);
+
         // A small file is one request; anything bigger is split, so a large upload never has to
         // be held in memory all at once.
         match body.size() {
@@ -375,6 +572,7 @@ impl Provider for S3Provider {
                     .put_object()
                     .bucket(&self.bucket)
                     .key(key)
+                    .set_content_type(media.map(str::to_owned))
                     .body(AwsStream::from(bytes))
                     .send()
                     .await
@@ -382,7 +580,7 @@ impl Provider for S3Provider {
 
                 Ok(())
             }
-            _ => self.upload_in_parts(&key, body).await,
+            _ => self.upload_in_parts(&key, media, body).await,
         }
     }
 
@@ -487,10 +685,7 @@ fn encoded_source(bucket: &str, key: &str) -> String {
 /// Reporting a refused key or a dropped connection as "does not exist" is worse than unhelpful:
 /// [`Error::NotFound`] is not transient, so the transfer queue will not retry what may only
 /// have been a blip.
-fn missing_or_refused<E>(error: E, path: &RemotePath) -> Error
-where
-    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
-{
+fn missing_or_refused<E: ProvideErrorMetadata>(error: E, path: &RemotePath) -> Error {
     let absent = matches!(
         error.code(),
         Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "404")
@@ -507,8 +702,43 @@ fn timestamp(at: &aws_smithy_types::DateTime) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(at.secs()).ok()
 }
 
-fn failed<E: std::fmt::Debug>(message: impl std::fmt::Display, error: E) -> Error {
-    Error::provider(format!("{message}: {error:?}"))
+/// What went wrong, in words.
+///
+/// The SDK's own `Debug` is four lines of nested structs with the sentence buried in the
+/// middle, and printing it puts that on screen where a person is meant to read it. Every S3
+/// error carries a code and usually a message; between them and the table below there is always
+/// something better to say.
+fn failed<E: ProvideErrorMetadata>(message: impl std::fmt::Display, error: E) -> Error {
+    Error::provider(format!("{message}: {}", explain(&error)))
+}
+
+fn explain<E: ProvideErrorMetadata>(error: &E) -> String {
+    if let Some(said) = plainly(error.code()) {
+        return said.to_owned();
+    }
+
+    match (error.message(), error.code()) {
+        (Some(message), _) => message.to_owned(),
+        (None, Some(code)) => format!("the server said {code}"),
+        (None, None) => "the server did not say why".to_owned(),
+    }
+}
+
+/// The handful of answers worth rewording, because the server's own wording assumes you know
+/// how S3 is put together.
+fn plainly(code: Option<&str>) -> Option<&'static str> {
+    match code? {
+        "AccessDenied" => Some("these credentials are not allowed to do that"),
+        "InvalidAccessKeyId" => Some("that access key is not one this store knows"),
+        "SignatureDoesNotMatch" => Some("the secret key does not match the access key"),
+        "NoSuchBucket" => Some("there is no bucket by that name"),
+        "NoSuchKey" | "NotFound" => Some("that file is not there"),
+        "BucketAlreadyOwnedByYou" => Some("that bucket is already yours"),
+        "EntityTooLarge" => Some("that file is larger than this store will take"),
+        "RequestTimeTooSkewed" => Some("this machine's clock is too far from the server's"),
+        "SlowDown" | "ServiceUnavailable" => Some("the store is busy — try again shortly"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

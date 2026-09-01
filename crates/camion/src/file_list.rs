@@ -1,11 +1,13 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
-use camion_core::{Column, Entry, RemotePath, Sort};
+use camion_core::{Access, Column, Entry, RemotePath, Sort, Who};
 use camion_engine::transfer::Endpoint;
 use camion_engine::{Event, SessionId, TransferId};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{
-    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
+    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QMap, QMapPair_QString_QVariant,
+    QModelIndex, QString, QVariant,
 };
 
 use crate::format;
@@ -27,6 +29,11 @@ pub mod qobject {
         type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         include!("cxx-qt-lib/qlist.h");
         type QList_i32 = cxx_qt_lib::QList<i32>;
+    }
+
+    unsafe extern "C++" {
+        include!("cxx-qt-lib/qmap.h");
+        type QMap_QString_QVariant = cxx_qt_lib::QMap<cxx_qt_lib::QMapPair_QString_QVariant>;
     }
 
     unsafe extern "C++Qt" {
@@ -59,6 +66,10 @@ pub mod qobject {
         #[cxx_name = "roleNames"]
         fn role_names(self: &FileList) -> QHash_i32_QByteArray;
 
+        /// Shows the connection its window has open, and empties itself when that changes.
+        #[qinvokable]
+        fn follow(self: Pin<&mut FileList>, session: i64);
+
         /// The row a type-ahead search should land on, or -1 when nothing matches.
         #[qinvokable]
         fn find(self: &FileList, prefix: QString, after: i32) -> i32;
@@ -72,6 +83,13 @@ pub mod qobject {
         /// The icon of a row, which is what a drag of it should look like.
         #[qinvokable]
         fn icon_at(self: &FileList, row: i32) -> QString;
+
+        /// Everything known about one row, for showing it on its own.
+        ///
+        /// Handed over as one object rather than a getter per column, because the columns are
+        /// already worked out when the listing is built and this is the same set of them.
+        #[qinvokable]
+        fn details(self: &FileList, row: i32) -> QMap_QString_QVariant;
     }
 
     unsafe extern "RustQt" {
@@ -127,7 +145,11 @@ pub struct FileListRust {
     session: Option<SessionId>,
 
     /// What the server last said is here.
-    entries: Vec<Entry>,
+    ///
+    /// Shared with the rows rather than copied into them: sorting is done on the handles, and a
+    /// folder of fifty thousand files would otherwise hold every name twice over — once here
+    /// and once in the row drawing it.
+    entries: Vec<Arc<Entry>>,
 
     /// What is on its way here. Shown alongside the real entries so that dropping a file puts
     /// it in the list at once, with a bar that fills — rather than nothing happening until the
@@ -170,7 +192,7 @@ impl Arriving {
 /// `data` is called once per column per repaint, so the columns are written when the listing
 /// is built rather than re-derived every time the view scrolls past them.
 struct Row {
-    entry: Entry,
+    entry: Arc<Entry>,
     icon: String,
     size: String,
     modified: String,
@@ -180,7 +202,12 @@ struct Row {
 }
 
 impl Row {
-    fn new(icon: String, fraction: Option<f64>, now: time::OffsetDateTime, entry: Entry) -> Self {
+    fn new(
+        icon: String,
+        fraction: Option<f64>,
+        now: time::OffsetDateTime,
+        entry: Arc<Entry>,
+    ) -> Self {
         Self {
             icon,
             size: match entry.kind.is_folder() {
@@ -223,17 +250,10 @@ impl cxx_qt::Initialize for qobject::FileList {
     fn initialize(self: Pin<&mut Self>) {
         let thread = self.qt_thread();
 
+        // Every event carries the session it came from, and a list beside this one has to
+        // ignore the other's news rather than redraw itself with it — so the filtering happens
+        // here, where the answer to "which connection am I" can actually be read.
         crate::bus::listen(move |event| match event.as_ref() {
-            // Which connection this list is showing. Every event carries the session it came
-            // from, and a list beside this one has to ignore the other's news rather than
-            // redraw itself with it — so the filtering happens in the model, where the answer
-            // to "which connection am I" can actually be read.
-            Event::Connected { session, .. } => {
-                let session = *session;
-
-                crate::qt::queue(&thread, move |model| model.follow(session));
-            }
-
             Event::Listing { session, path, entries } => {
                 let (session, path, entries) = (*session, path.clone(), entries.clone());
 
@@ -393,6 +413,61 @@ impl qobject::FileList {
         self.at(row).is_some_and(|row| row.entry.kind.is_folder())
     }
 
+    pub fn details(&self, row: i32) -> QMap<QMapPair_QString_QVariant> {
+        let mut details = QMap::<QMapPair_QString_QVariant>::default();
+
+        let Some(row) = self.at(row) else {
+            return details;
+        };
+
+        let mut put = |key: &str, value: &str| {
+            details.insert(QString::from(key), QVariant::from(&QString::from(value)));
+        };
+
+        put("name", &row.entry.name);
+        put("kind", row.kind);
+        put("size", &row.size);
+        put("modified", &row.modified);
+        put("permissions", &row.permissions);
+        put("icon", &row.icon);
+
+        details.insert(
+            QString::from("isFolder"),
+            QVariant::from(&row.entry.kind.is_folder()),
+        );
+
+        // The exact number as well as the readable one: "244 KB" is what you want to read and
+        // the wrong thing to check a download against.
+        details.insert(
+            QString::from("bytes"),
+            QVariant::from(&(row.entry.size as i64)),
+        );
+
+        // The mode as nine answers rather than nine characters. `rw-rw-r--` is a shorthand you
+        // have to already know how to read, and this panel is the one place with room to spell
+        // it out.
+        if let Some(permissions) = row.entry.permissions {
+            for (who, name) in [
+                (Who::Owner, "owner"),
+                (Who::Group, "group"),
+                (Who::Everyone, "everyone"),
+            ] {
+                for (access, verb) in [
+                    (Access::Read, "read"),
+                    (Access::Write, "write"),
+                    (Access::Execute, "execute"),
+                ] {
+                    details.insert(
+                        QString::from(&format!("{name}-{verb}")),
+                        QVariant::from(&permissions.allows(who, access)),
+                    );
+                }
+            }
+        }
+
+        details
+    }
+
     /// The row at `row`, if there is one.
     ///
     /// QML says "nothing is selected" with `-1`, and clamping that to zero would quietly answer
@@ -407,9 +482,25 @@ impl qobject::FileList {
         self.rebuild();
     }
 
-    /// Starts showing a connection.
-    fn follow(mut self: Pin<&mut Self>, session: SessionId) {
-        self.as_mut().rust_mut().session = Some(session);
+    /// Starts showing a connection, and stops showing whatever was there before.
+    ///
+    /// Told which one rather than working it out from whichever connection opened last. Every
+    /// window hears every connection open, so a list that adopted the newest would swap to the
+    /// server the window next door had just reached.
+    ///
+    /// Zero is no connection at all, which is what disconnecting leaves behind.
+    pub fn follow(mut self: Pin<&mut Self>, session: i64) {
+        let now = match u64::try_from(session) {
+            Ok(0) | Err(_) => None,
+            Ok(id) => Some(SessionId(id)),
+        };
+
+        if self.rust().session == now {
+            return;
+        }
+
+        self.as_mut().rust_mut().session = now;
+        self.empty();
     }
 
     /// Whether news from `session` is news about what this list is showing.
@@ -417,10 +508,22 @@ impl qobject::FileList {
         self.rust().session == Some(session)
     }
 
+    /// Puts the list back to an empty root.
+    ///
+    /// What is on screen belongs to whichever connection was open before, and leaving it there
+    /// means a moment where a new server appears to hold another one's files — and a moment is
+    /// long enough to click something.
+    fn empty(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().arriving.clear();
+        self.as_mut().rust_mut().entries.clear();
+        self.as_mut().set_path(QString::from("/"));
+        self.rebuild();
+    }
+
     fn close(mut self: Pin<&mut Self>, session: SessionId) {
         if self.showing(session) {
             self.as_mut().rust_mut().session = None;
-            self.replace(session, RemotePath::root(), Vec::new());
+            self.empty();
         }
     }
 
@@ -443,7 +546,7 @@ impl qobject::FileList {
             .retain(|arriving| !(arriving.landed && arriving.folder == path));
 
         self.as_mut().set_path(QString::from(&path.to_string()));
-        self.as_mut().rust_mut().entries = entries;
+        self.as_mut().rust_mut().entries = entries.into_iter().map(Arc::new).collect();
         self.rebuild();
     }
 
@@ -565,15 +668,16 @@ fn column_named(name: &str) -> Column {
 /// second row with the same name; anything genuinely new goes at the end, where new things
 /// appear rather than jumping into the middle of a list you are reading.
 fn merge(
-    entries: &[Entry],
+    entries: &[Arc<Entry>],
     arriving: &[Arriving],
     here: &RemotePath,
     showing_hidden: bool,
     sort: Sort,
     icons: &crate::icons::Icons,
 ) -> Vec<Row> {
+    // Cloned handles, not files: this is a list of pointers being sorted.
     let mut entries = entries.to_vec();
-    sort.apply(&mut entries);
+    sort.apply_to(&mut entries);
 
     // One clock reading for the whole listing, so two files saved a second apart do not end up
     // described relative to different "now"s.
@@ -611,7 +715,7 @@ fn merge(
             icons.for_file(&arriving.name, false),
             arriving.fraction(),
             now,
-            Entry::file(&arriving.name, arriving.total.unwrap_or_default()),
+            Arc::new(Entry::file(&arriving.name, arriving.total.unwrap_or_default())),
         ));
     }
 
@@ -634,8 +738,10 @@ mod tests {
     }
 
     fn merged(entries: &[Entry], arriving: &[Arriving], here: &str) -> Vec<Row> {
+        let entries = entries.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+
         merge(
-            entries,
+            &entries,
             arriving,
             &RemotePath::parse(here).unwrap(),
             false,

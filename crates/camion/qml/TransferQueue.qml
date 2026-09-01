@@ -5,6 +5,11 @@ import io.camion
 Dialog {
     id: queue
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     required property var transfers
 
     title: "Transfers"
@@ -120,7 +125,7 @@ Dialog {
                 anchors.verticalCenter: parent.verticalCenter
                 text: "Cancel"
                 visible: item.running
-                onClicked: App.cancelTransfer(queue.transfers.idAt(item.index))
+                onClicked: app.cancelTransfer(queue.transfers.idAt(item.index))
             }
         }
 

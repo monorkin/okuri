@@ -9,6 +9,11 @@ import io.camion
 DropArea {
     id: spring
 
+    /// The window this belongs to. Passed in rather than reached for: there is one of these per
+    /// window now, and a component that went looking for "the" application would find whichever
+    /// window happened to be first.
+    required property App app
+
     /// The folder to open, and to put things into.
     required property string folder
 
@@ -29,7 +34,7 @@ DropArea {
 
     onDropped: {
         waiting.stop()
-        App.moveInto(spring.folder)
+        app.moveInto(spring.folder)
     }
 
     Timer {
@@ -37,7 +42,7 @@ DropArea {
         interval: spring.delay
         onTriggered: {
             if (spring.containsDrag) {
-                App.openPath(spring.folder)
+                app.openPath(spring.folder)
             }
         }
     }

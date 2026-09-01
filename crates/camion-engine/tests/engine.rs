@@ -6,8 +6,10 @@ use std::time::Duration;
 use camion_core::RemotePath;
 use camion_engine::engine::Command;
 use camion_engine::event::Outcome;
-use camion_engine::secrets::InMemory;
-use camion_engine::{Answer, Connection, Emitter, Engine, Event, SessionId, Vault};
+use camion_engine::secrets::{InMemory, SecretStore};
+use camion_engine::{
+    Answer, Attempt, Concern, Connection, Emitter, Engine, Event, SessionId, Vault,
+};
 use camion_providers::Destination;
 
 /// Collects events off the engine's thread and hands them back one at a time, so a test can
@@ -74,10 +76,13 @@ fn started() -> (Engine, Watcher, SessionId) {
     let (watcher, emit) = Watcher::new();
     let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
 
-    engine.send(Command::Connect(Box::new(Connection::new(
-        "Scratch",
-        Destination::Memory,
-    ))));
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new(
+            "Scratch",
+            Destination::Memory,
+        )),
+    });
 
     let session = watcher.wait_for_session();
 
@@ -322,7 +327,7 @@ fn a_folder_cannot_be_moved_into_itself() {
     });
 
     let message = watcher.wait_for(|event| match event {
-        Event::Failed { message } => Some(message),
+        Event::Failed { message, .. } => Some(message),
         _ => None,
     });
 
@@ -365,7 +370,7 @@ fn a_command_for_a_connection_that_is_not_open_is_reported_not_ignored() {
     engine.send(Command::Refresh(SessionId(404)));
 
     let message = watcher.wait_for(|event| match event {
-        Event::Failed { message } => Some(message),
+        Event::Failed { message, .. } => Some(message),
         _ => None,
     });
 
@@ -380,18 +385,21 @@ fn an_object_store_asks_for_both_halves_of_its_key() {
     let (watcher, emit) = Watcher::new();
     let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
 
-    engine.send(Command::Connect(Box::new(Connection::new(
-        "Assets",
-        Destination::S3(S3 {
-            bucket: "assets".to_owned(),
-            preset: S3Preset::Other,
-            region: "us-east-1".to_owned(),
-            // Nothing listens here, so the connection fails at once — after the keys have
-            // been asked for and accepted, which is what this test is about.
-            endpoint: "http://127.0.0.1:1".to_owned(),
-            root: String::new(),
-        }),
-    ))));
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new(
+            "Assets",
+            Destination::S3(S3 {
+                bucket: "assets".to_owned(),
+                preset: S3Preset::Other,
+                region: "us-east-1".to_owned(),
+                // Nothing listens here, so the connection fails at once — after the keys have
+                // been asked for and accepted, which is what this test is about.
+                endpoint: "http://127.0.0.1:1".to_owned(),
+                root: String::new(),
+            }),
+        )),
+    });
 
     let asked = watcher.wait_for(|event| match event {
         Event::Ask(prompt) => Some(prompt),
@@ -416,19 +424,22 @@ fn a_destination_that_needs_a_password_asks_for_one() {
     let (watcher, emit) = Watcher::new();
     let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
 
-    engine.send(Command::Connect(Box::new(Connection::new(
-        "Files",
-        // A port nothing listens on, so the connection fails at once and without the test
-        // depending on a name that has to be resolved.
-        Destination::Ftp(camion_providers::destination::Ftp {
-            host: "127.0.0.1".to_owned(),
-            port: 1,
-            username: "camion".to_owned(),
-            encrypted: true,
-            passive: true,
-            home: String::new(),
-        }),
-    ))));
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new(
+            "Files",
+            // A port nothing listens on, so the connection fails at once and without the test
+            // depending on a name that has to be resolved.
+            Destination::Ftp(camion_providers::destination::Ftp {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "camion".to_owned(),
+                encrypted: true,
+                passive: true,
+                home: String::new(),
+            }),
+        )),
+    });
 
     let asked = watcher.wait_for(|event| match event {
         Event::Ask(prompt) => Some(prompt),
@@ -457,13 +468,25 @@ fn a_cancelled_transfer_stops_and_says_it_was_cancelled() {
     let directory = tempfile::tempdir().unwrap();
     let dropped = directory.path().join("endless.bin");
 
-    // A pipe with nothing on the far end, so the upload is still going when the cancel lands.
-    // A real file would race: a few megabytes into memory can finish before the next command
-    // is read, and then the test would be measuring who won rather than what cancelling does.
+    // A pipe that is open but never written to, so the upload is still going when the cancel
+    // lands. A real file would race: a few megabytes into memory can finish before the next
+    // command is read, and the test would be measuring who won rather than what cancelling does.
     assert!(
         std::process::Command::new("mkfifo").arg(&dropped).status().unwrap().success(),
         "mkfifo"
     );
+
+    // Held open from here for reading *and* writing. Opening a pipe either way alone waits for
+    // the other end: without this the engine blocks inside `open` on a thread it never gets
+    // back, and opening it write-only from a thread of our own only moves the problem — a
+    // cancel that lands before the upload opens its end leaves that thread waiting for a reader
+    // that is never coming, and the test hangs instead of failing. Read-write never blocks, and
+    // holding it is what keeps the upload from finishing on its own.
+    let far_end = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dropped)
+        .expect("the far end of the pipe");
 
     let (engine, watcher, session) = started();
     watcher.wait_for_listing("/");
@@ -483,6 +506,8 @@ fn a_cancelled_transfer_stops_and_says_it_was_cancelled() {
     });
 
     assert_eq!(outcome, Outcome::Cancelled);
+
+    drop(far_end);
 }
 
 /// A machine with no keyring keeps its secrets in a passphrase-encrypted file, and the
@@ -496,17 +521,20 @@ fn a_locked_secrets_file_is_asked_about_before_anything_is_read_from_it() {
     let (watcher, emit) = Watcher::new();
     let engine = Engine::start(Arc::new(Vault::locked(directory.path().join("secrets"))), emit);
 
-    engine.send(Command::Connect(Box::new(Connection::new(
-        "Files",
-        Destination::Ftp(camion_providers::destination::Ftp {
-            host: "127.0.0.1".to_owned(),
-            port: 1,
-            username: "camion".to_owned(),
-            encrypted: false,
-            passive: true,
-            home: String::new(),
-        }),
-    ))));
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new(
+            "Files",
+            Destination::Ftp(camion_providers::destination::Ftp {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "camion".to_owned(),
+                encrypted: false,
+                passive: true,
+                home: String::new(),
+            }),
+        )),
+    });
 
     let asked = watcher.wait_for(|event| match event {
         Event::Ask(prompt) => Some(prompt),
@@ -534,17 +562,20 @@ fn refusing_the_passphrase_abandons_the_connection() {
     let (watcher, emit) = Watcher::new();
     let engine = Engine::start(Arc::new(Vault::locked(directory.path().join("secrets"))), emit);
 
-    engine.send(Command::Connect(Box::new(Connection::new(
-        "Files",
-        Destination::Ftp(camion_providers::destination::Ftp {
-            host: "127.0.0.1".to_owned(),
-            port: 1,
-            username: "camion".to_owned(),
-            encrypted: false,
-            passive: true,
-            home: String::new(),
-        }),
-    ))));
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new(
+            "Files",
+            Destination::Ftp(camion_providers::destination::Ftp {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "camion".to_owned(),
+                encrypted: false,
+                passive: true,
+                home: String::new(),
+            }),
+        )),
+    });
 
     let asked = watcher.wait_for(|event| match event {
         Event::Ask(prompt) => Some(prompt),
@@ -643,4 +674,153 @@ fn declining_uploads_nothing_at_all() {
 
     assert!(!names.contains(&"README (2).md".to_owned()), "{names:?}");
     drop(engine);
+}
+
+/// Connecting asks for a credential only when none is stored, so replacing a mistyped one needs
+/// its own way in — otherwise a wrong access key is permanent short of editing the keyring.
+#[test]
+fn changing_credentials_replaces_what_was_stored() {
+    use camion_engine::Question;
+    use camion_providers::destination::{S3Preset, S3};
+    use camion_providers::Secret;
+
+    let store = Arc::new(InMemory::default());
+    let connection = Connection::new(
+        "Assets",
+        Destination::S3(S3 {
+            bucket: "assets".to_owned(),
+            preset: S3Preset::Other,
+            region: "us-east-1".to_owned(),
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            root: String::new(),
+        }),
+    );
+
+    store
+        .set(
+            &connection.id,
+            &Secret::KeyPair { id: "WRONG".to_owned(), secret: "wrong".to_owned() },
+        )
+        .unwrap();
+
+    let (watcher, emit) = Watcher::new();
+    let engine = Engine::start(Arc::new(Vault::open(Arc::clone(&store) as _)), emit);
+
+    engine.send(Command::ChangeCredentials {
+        attempt: Attempt::next(),
+        connection: Box::new(connection.clone()),
+    });
+
+    let asked = watcher.wait_for(|event| match event {
+        Event::Ask(prompt) => Some(prompt),
+        _ => None,
+    });
+
+    assert!(matches!(asked.question, Question::KeyPair { .. }));
+
+    asked.answer(Answer::Pair { id: "RIGHT".to_owned(), secret: "right".to_owned() });
+
+    watcher.wait_for(|event| match event {
+        Event::Notice { message, .. } => Some(message),
+        _ => None,
+    });
+
+    assert_eq!(
+        store.get(&connection.id).unwrap(),
+        Secret::KeyPair { id: "RIGHT".to_owned(), secret: "right".to_owned() }
+    );
+}
+
+/// A dialog closed by accident must not throw away a credential that was working.
+#[test]
+fn declining_leaves_the_old_credentials_alone() {
+    use camion_providers::Secret;
+
+    let store = Arc::new(InMemory::default());
+    let connection = Connection::new(
+        "Files",
+        Destination::Ftp(camion_providers::destination::Ftp {
+            host: "127.0.0.1".to_owned(),
+            port: 1,
+            username: "camion".to_owned(),
+            encrypted: false,
+            passive: true,
+            home: String::new(),
+        }),
+    );
+
+    let kept = Secret::Password("still good".to_owned());
+    store.set(&connection.id, &kept).unwrap();
+
+    let (watcher, emit) = Watcher::new();
+    let engine = Engine::start(Arc::new(Vault::open(Arc::clone(&store) as _)), emit);
+
+    engine.send(Command::ChangeCredentials {
+        attempt: Attempt::next(),
+        connection: Box::new(connection.clone()),
+    });
+
+    let asked = watcher.wait_for(|event| match event {
+        Event::Ask(prompt) => Some(prompt),
+        _ => None,
+    });
+
+    asked.answer(Answer::Decline);
+
+    // Nothing to wait for, so the next command's answer is what says the first one is over.
+    engine.send(Command::Refresh(SessionId(404)));
+    watcher.wait_for(|event| match event {
+        Event::Failed { .. } => Some(()),
+        _ => None,
+    });
+
+    assert_eq!(store.get(&connection.id).unwrap(), kept);
+}
+
+/// Two connections opening at once are two sets of questions, and the only thing telling them
+/// apart is the attempt each one carries. Without it, both windows show both prompts and the
+/// second dialog is left asking about work the first has already answered.
+#[test]
+fn a_question_says_which_connection_it_is_holding_up() {
+    use camion_providers::destination::Ftp;
+
+    // Two destinations that ask for a credential and then fail to connect, so each attempt is
+    // over as soon as its question is answered.
+    let refused = |name: &str| {
+        Connection::new(
+            name,
+            Destination::Ftp(Ftp {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "camion".to_owned(),
+                encrypted: false,
+                passive: true,
+                home: String::new(),
+            }),
+        )
+    };
+
+    let (watcher, emit) = Watcher::new();
+    let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
+
+    let (ours, theirs) = (Attempt::next(), Attempt::next());
+
+    engine.send(Command::Connect { attempt: ours, connection: Box::new(refused("First")) });
+    engine.send(Command::Connect { attempt: theirs, connection: Box::new(refused("Second")) });
+
+    let mut asked = Vec::new();
+
+    while asked.len() < 2 {
+        let prompt = watcher.wait_for(|event| match event {
+            Event::Ask(prompt) => Some(prompt),
+            _ => None,
+        });
+
+        asked.push(prompt.concern);
+        prompt.answer(Answer::Decline);
+    }
+
+    asked.sort_by_key(|concern| format!("{concern:?}"));
+
+    assert_eq!(asked, vec![Concern::Attempt(ours), Concern::Attempt(theirs)]);
 }

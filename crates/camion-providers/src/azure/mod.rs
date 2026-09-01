@@ -2,7 +2,8 @@ mod signing;
 
 use async_trait::async_trait;
 use camion_core::{
-    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    Served, Serving, Stored, Storing,
 };
 use futures::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -98,7 +99,7 @@ impl AzureProvider {
         path: &str,
         query: &[(String, String)],
         mut headers: HeaderMap,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
     ) -> Result<reqwest::Response> {
         // Azure wants `Tue, 26 Aug 2026 10:00:00 GMT`, which is RFC 2822 with the offset
         // spelled the way HTTP spells it rather than as `+0000`.
@@ -110,6 +111,7 @@ impl AzureProvider {
         headers.insert("x-ms-date", header_value(&now)?);
         headers.insert("x-ms-version", header_value(VERSION)?);
 
+        let body = body.into();
         let authorization = signing::authorization(
             &self.account,
             &self.key,
@@ -214,44 +216,53 @@ impl AzureProvider {
         use base64::Engine as _;
 
         let encoding = base64::engine::general_purpose::STANDARD;
-        let mut blocks = Vec::new();
-
-        while let Some(block) = crate::parts::next_part(&mut body, BLOCK_SIZE).await? {
+        // Several blocks at once: the block list sent at the end is what puts them in order,
+        // so they need not go up in order. Sending them one after another leaves the link idle
+        // for as long as reading the next block off disk takes.
+        let blocks = crate::parts::each_part(&mut body, BLOCK_SIZE, |index, block| {
             // Block ids have to be the same length for every block in one blob, so they are a
             // fixed-width number rather than anything more descriptive.
-            let id = encoding.encode(format!("camion-{:08}", blocks.len()));
+            let id = encoding.encode(format!("camion-{index:08}"));
 
-            let response = self
-                .send(
-                    Method::PUT,
-                    &self.blob_path(path),
-                    &[
-                        ("comp".to_owned(), "block".to_owned()),
-                        ("blockid".to_owned(), id.clone()),
-                    ],
-                    HeaderMap::new(),
-                    block,
-                )
-                .await?;
+            async {
+                let id = id;
+                let response = self
+                    .send(
+                        Method::PUT,
+                        &self.blob_path(path),
+                        &[
+                            ("comp".to_owned(), "block".to_owned()),
+                            ("blockid".to_owned(), id.clone()),
+                        ],
+                        HeaderMap::new(),
+                        block,
+                    )
+                    .await?;
 
-            if !response.status().is_success() {
-                return Err(refused(response.status(), path, "upload"));
+                match response.status().is_success() {
+                    true => Ok(id),
+                    false => Err(refused(response.status(), path, "upload")),
+                }
             }
-
-            blocks.push(id);
-        }
+        })
+        .await?;
 
         let list = blocks
             .iter()
             .map(|id| format!("<Latest>{id}</Latest>"))
             .collect::<String>();
 
+        // Set here rather than on the blocks: the block list is what makes the blob, and it is
+        // the only request in a multipart upload that carries the blob's own headers.
+        let mut headers = HeaderMap::new();
+        self.say_what_it_is(path, &mut headers)?;
+
         let response = self
             .send(
                 Method::PUT,
                 &self.blob_path(path),
                 &[("comp".to_owned(), "blocklist".to_owned())],
-                HeaderMap::new(),
+                headers,
                 format!(
                     r#"<?xml version="1.0" encoding="utf-8"?><BlockList>{list}</BlockList>"#
                 )
@@ -266,10 +277,80 @@ impl AzureProvider {
     }
 }
 
+impl AzureProvider {
+    /// Says what kind of thing is being uploaded.
+    ///
+    /// Said at upload time because it cannot be said later without rewriting the blob — and a
+    /// store told nothing serves `application/octet-stream` to everybody, which is the
+    /// difference between a browser showing an image and downloading it.
+    fn say_what_it_is(&self, path: &RemotePath, headers: &mut HeaderMap) -> Result<()> {
+        if let Some(media) = path.name().and_then(media_type) {
+            headers.insert("x-ms-blob-content-type", header_value(media)?);
+        }
+
+        Ok(())
+    }
+
+    /// One `HEAD`, which is where every answer about a single blob comes from.
+    async fn head(&self, path: &RemotePath) -> Result<HeaderMap> {
+        let response = self
+            .send(Method::HEAD, &self.blob_path(path), &[], HeaderMap::new(), Vec::new())
+            .await?;
+
+        match response.status().is_success() {
+            true => Ok(response.headers().clone()),
+            false => Err(refused(response.status(), path, "read the blob's details")),
+        }
+    }
+}
+
+/// A header, if the blob has one.
+fn said(headers: &HeaderMap, header: &str) -> Option<String> {
+    headers
+        .get(header)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[async_trait]
+impl Serving for AzureProvider {
+    async fn served(&self, path: &RemotePath) -> Result<Served> {
+        let headers = self.head(path).await?;
+
+        Ok(Served {
+            content_type: said(&headers, "content-type"),
+            etag: said(&headers, "etag").map(|tag| tag.trim_matches('"').to_owned()),
+            cache_control: said(&headers, "cache-control"),
+            content_encoding: said(&headers, "content-encoding"),
+        })
+    }
+}
+
+#[async_trait]
+impl Storing for AzureProvider {
+    async fn stored(&self, path: &RemotePath) -> Result<Stored> {
+        let headers = self.head(path).await?;
+
+        Ok(Stored {
+            class: said(&headers, "x-ms-access-tier"),
+            encryption: said(&headers, "x-ms-server-encrypted"),
+            version: said(&headers, "x-ms-version-id"),
+        })
+    }
+}
+
 #[async_trait]
 impl Provider for AzureProvider {
     fn label(&self) -> String {
         self.label.clone()
+    }
+
+    fn serving(&self) -> Option<&dyn Serving> {
+        Some(self)
+    }
+
+    fn storing(&self) -> Option<&dyn Storing> {
+        Some(self)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -381,6 +462,7 @@ impl Provider for AzureProvider {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-ms-blob-type", header_value("BlockBlob")?);
+        self.say_what_it_is(path, &mut headers)?;
 
         let response = self
             .send(
@@ -388,7 +470,7 @@ impl Provider for AzureProvider {
                 &self.blob_path(path),
                 &[],
                 headers,
-                body.collect().await?.to_vec(),
+                body.collect().await?,
             )
             .await?;
 
