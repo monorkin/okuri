@@ -1,0 +1,201 @@
+use async_trait::async_trait;
+use okuri_providers::{HostKey, HostTrust, Trust};
+
+use crate::event::{Concern, Event, Prompt, Question};
+use crate::known_hosts::{KnownHosts, Verdict};
+use crate::Emitter;
+
+/// Answers "is this the server we meant?" by consulting `known_hosts` first and the person at
+/// the keyboard second.
+///
+/// Built per attempt at connecting rather than once for the application, because everything it
+/// says is about that one connection — and with two windows open, a fingerprint shown in the
+/// wrong one is a fingerprint nobody can check.
+pub struct PromptingTrust {
+    known_hosts: KnownHosts,
+    emit: Emitter,
+    concern: Concern,
+}
+
+impl PromptingTrust {
+    pub fn new(known_hosts: KnownHosts, emit: Emitter, concern: Concern) -> Self {
+        Self { known_hosts, emit, concern }
+    }
+
+    async fn ask(&self, question: Question) -> bool {
+        let (prompt, answer) = Prompt::new(self.concern, question);
+        (self.emit)(Event::Ask(prompt));
+
+        answer.await.map(|answer| answer.is_accepted()).unwrap_or(false)
+    }
+}
+
+#[async_trait]
+impl HostTrust for PromptingTrust {
+    async fn verify(&self, key: &HostKey) -> Trust {
+        let verdict = match self.known_hosts.verdict(key) {
+            Ok(verdict) => verdict,
+
+            // Every host would look unknown, and answering the prompt would append to a file
+            // that cannot be read. Refusing is the only honest answer.
+            Err(error) => {
+                (self.emit)(Event::Failed {
+                    concern: self.concern,
+                    message: format!("known_hosts could not be read, so {} cannot be verified: {error}", key.host),
+                });
+
+                return Trust::Rejected;
+            }
+        };
+
+        match verdict {
+            Verdict::Known => Trust::Known,
+
+            Verdict::Unknown => {
+                let accepted = self
+                    .ask(Question::UnknownHostKey {
+                        host: key.host.clone(),
+                        algorithm: key.algorithm.clone(),
+                        fingerprint: key.fingerprint.clone(),
+                    })
+                    .await;
+
+                if accepted {
+                    // Written to the real `known_hosts`, so `ssh` from a terminal agrees with
+                    // Okuri about what has been trusted, and neither asks twice. Failing to
+                    // write it does not stop this connection, but it does mean being asked
+                    // again next time — which is worth saying rather than looking like a bug.
+                    if let Err(error) = self.known_hosts.remember(key) {
+                        (self.emit)(Event::Failed {
+                            concern: self.concern,
+                            message: format!("{} was trusted, but could not be written to known_hosts: {error}", key.host),
+                        });
+                    }
+
+                    Trust::Accepted
+                } else {
+                    Trust::Rejected
+                }
+            }
+
+            // A key that changed is either a rebuilt server or somebody in the middle, and
+            // Okuri cannot tell which. Accepting lets this one connection through and
+            // deliberately does not rewrite the file: replacing a trusted key is a decision for
+            // `ssh-keygen -R`, made deliberately, not a side effect of wanting to see a folder.
+            Verdict::Changed => {
+                let accepted = self
+                    .ask(Question::ChangedHostKey {
+                        host: key.host.clone(),
+                        algorithm: key.algorithm.clone(),
+                        fingerprint: key.fingerprint.clone(),
+                    })
+                    .await;
+
+                if accepted {
+                    Trust::Accepted
+                } else {
+                    Trust::Rejected
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Answer;
+    use std::sync::Arc;
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyDataHere0000000000000000";
+
+    fn host_key(public_key: &str) -> HostKey {
+        HostKey {
+            host: "example.com".to_owned(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:whatever".to_owned(),
+            public_key: public_key.to_owned(),
+        }
+    }
+
+    fn answering(answer: Answer) -> Emitter {
+        Arc::new(move |event| {
+            if let Event::Ask(prompt) = event {
+                prompt.answer(answer.clone());
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_key_already_on_file_is_trusted_without_asking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("known_hosts");
+        std::fs::write(&path, format!("example.com {KEY}\n")).unwrap();
+
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = Arc::clone(&asked);
+        let emit: Emitter = Arc::new(move |event| {
+            if matches!(event, Event::Ask(_)) {
+                watcher.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let trust = PromptingTrust::new(KnownHosts::new(path), emit, Concern::Everyone);
+
+        assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Known);
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn accepting_a_new_key_writes_it_to_known_hosts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("known_hosts");
+
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept), Concern::Everyone);
+
+        assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Accepted);
+        assert_eq!(KnownHosts::new(&path).verdict(&host_key(KEY)).unwrap(), Verdict::Known);
+    }
+
+    #[tokio::test]
+    async fn declining_a_new_key_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("known_hosts");
+
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Decline), Concern::Everyone);
+
+        assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Rejected);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn accepting_a_changed_key_does_not_overwrite_the_one_on_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("known_hosts");
+        std::fs::write(&path, format!("example.com {KEY}\n")).unwrap();
+
+        let different = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDifferentKeyData00000000000000000";
+        let trust = PromptingTrust::new(KnownHosts::new(&path), answering(Answer::Accept), Concern::Everyone);
+
+        assert_eq!(trust.verify(&host_key(different)).await, Trust::Accepted);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("example.com {KEY}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_nobody_answers_rejects_the_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let emit: Emitter = Arc::new(|_event| {});
+
+        let trust = PromptingTrust::new(
+            KnownHosts::new(directory.path().join("known_hosts")),
+            emit,
+            Concern::Everyone,
+        );
+
+        assert_eq!(trust.verify(&host_key(KEY)).await, Trust::Rejected);
+    }
+}

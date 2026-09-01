@@ -1,0 +1,17 @@
+[package]
+name = "okuri-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Okuri domain: paths, entries, capabilities, and the Provider trait"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

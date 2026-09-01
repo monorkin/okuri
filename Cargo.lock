@@ -916,92 +916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "camion"
-version = "0.1.0"
-dependencies = [
- "camion-core",
- "camion-engine",
- "camion-providers",
- "cxx",
- "cxx-qt",
- "cxx-qt-build",
- "cxx-qt-lib",
- "notify",
- "serde",
- "tempfile",
- "time",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "camion-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "thiserror 2.0.20",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "camion-engine"
-version = "0.1.0"
-dependencies = [
- "argon2 0.5.3",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "camion-core",
- "camion-providers",
- "chacha20poly1305",
- "futures",
- "hmac 0.12.1",
- "keyring",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha1 0.10.7",
- "tempfile",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tokio-util",
- "toml",
-]
-
-[[package]]
-name = "camion-providers"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "aws-smithy-types",
- "base64 0.23.1",
- "bytes",
- "camion-core",
- "futures",
- "hmac 0.12.1",
- "percent-encoding",
- "quick-xml",
- "reqwest",
- "russh",
- "russh-sftp",
- "rustls-platform-verifier",
- "serde",
- "sha2 0.10.9",
- "suppaftp",
- "time",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-util",
- "toml",
-]
-
-[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3064,6 +2978,92 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "okuri"
+version = "0.1.0"
+dependencies = [
+ "cxx",
+ "cxx-qt",
+ "cxx-qt-build",
+ "cxx-qt-lib",
+ "notify",
+ "okuri-core",
+ "okuri-engine",
+ "okuri-providers",
+ "serde",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "okuri-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "okuri-engine"
+version = "0.1.0"
+dependencies = [
+ "argon2 0.5.3",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chacha20poly1305",
+ "futures",
+ "hmac 0.12.1",
+ "keyring",
+ "okuri-core",
+ "okuri-providers",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
+name = "okuri-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "hmac 0.12.1",
+ "okuri-core",
+ "percent-encoding",
+ "quick-xml",
+ "reqwest",
+ "russh",
+ "russh-sftp",
+ "rustls-platform-verifier",
+ "serde",
+ "sha2 0.10.9",
+ "suppaftp",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
+ "toml",
 ]
 
 [[package]]

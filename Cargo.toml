@@ -1,22 +1,22 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/camion-core",
-    "crates/camion-providers",
-    "crates/camion-engine",
-    "crates/camion",
+    "crates/okuri-core",
+    "crates/okuri-providers",
+    "crates/okuri-engine",
+    "crates/okuri",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/monorkin/camion"
+repository = "https://github.com/monorkin/okuri"
 
 [workspace.dependencies]
-camion-core = { path = "crates/camion-core" }
-camion-engine = { path = "crates/camion-engine" }
-camion-providers = { path = "crates/camion-providers" }
+okuri-core = { path = "crates/okuri-core" }
+okuri-engine = { path = "crates/okuri-engine" }
+okuri-providers = { path = "crates/okuri-providers" }
 
 async-trait = "0.1"
 bytes = "1"

@@ -1,15 +1,15 @@
-# Working on Camion
+# Working on Okuri
 
-The README says what Camion is. This says what it is like to change it, and what has already
+The README says what Okuri is. This says what it is like to change it, and what has already
 gone wrong so it does not go wrong again.
 
 ## The layers, and what each one is allowed to know
 
 ```
-camion-core       the domain. No HTTP, no SSH, no Qt.
-camion-providers  the adapters, plus config shapes, secrets, host trust.
-camion-engine     the runtime: sessions, transfers, prompts, config. No Qt.
-camion            the Qt binary: bridges + QML.
+okuri-core       the domain. No HTTP, no SSH, no Qt.
+okuri-providers  the adapters, plus config shapes, secrets, host trust.
+okuri-engine     the runtime: sessions, transfers, prompts, config. No Qt.
+okuri            the Qt binary: bridges + QML.
 ```
 
 Dependencies run one way and nothing flows back down. The interface talks to the engine only in
@@ -17,11 +17,11 @@ Dependencies run one way and nothing flows back down. The interface talks to the
 
 ## Windows, and why nothing is a singleton any more
 
-Camion opens as many windows as you ask for, and each one is a separate connection. The engine
+Okuri opens as many windows as you ask for, and each one is a separate connection. The engine
 always allowed that — sessions have lived in a registry from the start — so what changed was
 above it:
 
-- **The root QML file is `Camion.qml`, not `Main.qml`.** It is a `QtObject`, not a window: it
+- **The root QML file is `Okuri.qml`, not `Main.qml`.** It is a `QtObject`, not a window: it
   owns the windows and creates them, and a window asks for the next one by emitting `another`.
   A window that owned the list of windows would take the list with it when it closed.
 - **`App` is one per window**, declared in `Main.qml` and handed down. Every component that
@@ -31,7 +31,7 @@ above it:
 - **In `Main.qml` the object is `App { id: theApp }` behind `readonly property App app`.**
   Writing `app: app` on a child is a binding loop: the right-hand `app` resolves to the child's
   own property. Children get `app: window.app`.
-- **The engine is process-wide**, in `crates/camion/src/running.rs`. One runtime, one session
+- **The engine is process-wide**, in `crates/okuri/src/running.rs`. One runtime, one session
   registry, one transfer queue. A second engine would mean a transfer one window could not see.
 - **Every event says whose it is.** `Concern` is `Everyone`, `Attempt`, or `Session`;
   `Screen::receive` drops anything that is not this window's. An `Attempt` names a connection
@@ -42,7 +42,7 @@ above it:
 - **A new event that carries a session must be added to `Event::concern`.** Answering
   `Everyone` by default is how one window starts drawing another's files.
 - **A drag carries everything needed to act on it** (`Carried` in `screen.rs`, as the
-  `application/x-camion-move` payload): the session, the folder, and the names. It has to — a
+  `application/x-okuri-move` payload): the session, the folder, and the names. It has to — a
   drop can land in another window, and that window's `App` cannot ask the other one what was
   picked up.
 
@@ -79,7 +79,7 @@ What deliberately does *not* travel: ETag, storage class, encryption, version. T
 where a file lives rather than what it is, and copying them to another store would be stating
 something untrue about it.
 
-**Adding a destination** is one file in `camion-providers` implementing `Provider`, one arm in
+**Adding a destination** is one file in `okuri-providers` implementing `Provider`, one arm in
 `Destination`, and a conformance run. If it needs anything above it, something is wrong.
 
 ## The trait shape, which is the one architectural rule
@@ -104,7 +104,7 @@ Two rules that came out of getting this wrong:
   better than a method it answers with an error.
 - **Never let a provider return labelled strings for the interface to display.** There was a
   `describe() -> Vec<Fact>` doing exactly that; it put UI wording in the providers crate and
-  made every value un-actionable. Wording lives in `crates/camion/src/screen.rs`.
+  made every value un-actionable. Wording lives in `crates/okuri/src/screen.rs`.
 
 `Capabilities` flags for these are **derived in the engine** from whether the accessor answers,
 never declared by the adapter — a declared flag drifts from what the code does. That has already
@@ -128,7 +128,7 @@ The **conformance suite** is the load-bearing test idea. One set of checks writt
 `dyn Provider`, run against `MemoryProvider` in-process and against real containers behind
 `--ignored`, with capability flags deciding what is skipped. A new adapter is not done until it
 passes it. Anything a real server does that a fake cannot tell you — ACL support, content types,
-mode changes — belongs in `crates/camion-providers/tests/conformance.rs`, not a unit test.
+mode changes — belongs in `crates/okuri-providers/tests/conformance.rs`, not a unit test.
 
 If the FTP container starts failing on folders that should exist, it is holding state from an
 earlier broken run: `docker compose -f test/compose.yaml restart ftp`.
@@ -146,7 +146,7 @@ run produces no output at all — not even for a guaranteed `ReferenceError` —
 as success. This wasted several rounds:
 
 ```sh
-QT_FORCE_STDERR_LOGGING=1 QT_QPA_PLATFORM=offscreen timeout 8 ./target/debug/camion > run.log 2>&1
+QT_FORCE_STDERR_LOGGING=1 QT_QPA_PLATFORM=offscreen timeout 8 ./target/debug/okuri > run.log 2>&1
 cat run.log     # empty means clean, but only with the variable set
 ```
 
@@ -156,7 +156,7 @@ opened. To check one, temporarily add it to `Main.qml` with `visible: true` and 
 property, run headless, read the log, then take it out. `qmlcachegen` runs at build time and
 catches structural errors — an unbalanced brace fails the build — but not type errors.
 
-**Every new `.qml` file must be listed in `crates/camion/build.rs`.** Otherwise it does not
+**Every new `.qml` file must be listed in `crates/okuri/build.rs`.** Otherwise it does not
 exist to the engine, and the failure is `X is not a type` at runtime, which cascades into a
 window that never opens.
 
