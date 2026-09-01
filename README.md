@@ -17,7 +17,8 @@ Supports:
 
 **Omarchy:**
 ```bash
-omarchy pkg aur add okuri
+omarchy pkg aur add okuri-bin
+# omarchy pkg aur add okuri # builds from source
 ```
 
 **Arch:**
@@ -32,14 +33,6 @@ curl -fsSL https://raw.githubusercontent.com/monorkin/okuri/main/install.sh | ba
 ```
 
 ## Features
-
-### Minimal UI
-
-Okuri's UI is intentionally clean and minimal
-
-| | |
-|-|-|
-| <img width="440" height="367" alt="Okuri connected to a server" src="https://github.com/user-attachments/assets/f85287b3-cead-44a7-8b9b-d1a6b9939334" /> | <img width="440" height="366" alt="Okuri" src="https://github.com/user-attachments/assets/3be6409d-b5ce-4821-96a2-ccb36a5f1181" /> |
 
 ### Drag and drop
 
