@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use camion_core::conformance::Conformance;
-use camion_core::RemotePath;
+use camion_core::{RemotePath, Serve};
 use camion_providers::destination::{Sftp, SshCredential};
 use camion_providers::sftp::SftpProvider;
 use camion_providers::trust::TrustEverything;
@@ -509,7 +509,38 @@ async fn an_uploaded_file_says_what_it_is() {
         Some("application/octet-stream")
     );
 
-    for path in [small, large, unknown] {
+    // Told rather than guessed, which is the case a name cannot cover: a file copied here from
+    // another store knows what it is, and plenty of files worth serving have no extension at
+    // all. Guessing would make this an octet stream and a browser would download it.
+    let told = RemotePath::parse("/zxw70aa0i2orkjdfulmy8ckt7xox").unwrap();
+    let serve = Serve {
+        content_type: Some("image/png".to_owned()),
+        cache_control: Some("public, max-age=3600".to_owned()),
+        content_encoding: None,
+    };
+
+    provider
+        .write(&told, ByteStream::once(&b"not really a png"[..]).served_as(serve))
+        .await
+        .unwrap();
+
+    let said = provider.serving().unwrap().served(&told).await.unwrap();
+
+    assert_eq!(said.content_type.as_deref(), Some("image/png"));
+    assert_eq!(said.cache_control.as_deref(), Some("public, max-age=3600"));
+
+    // And reading it back says the same, off the download itself rather than a second request.
+    // This is the other half of copying a file to another store with what it is intact: the
+    // read tells us, the write is told, and nothing in between has to ask.
+    let coming_back = provider.read(&told, None).await.unwrap();
+
+    assert_eq!(coming_back.serve().content_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        coming_back.serve().cache_control.as_deref(),
+        Some("public, max-age=3600")
+    );
+
+    for path in [small, large, unknown, told] {
         provider.delete(&path).await.unwrap();
     }
 }

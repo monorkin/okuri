@@ -78,10 +78,10 @@ FocusScope {
 
         Drag.mimeData: app.dragUrls.length > 0
             ? ({
-                "application/x-camion-move": app.moving.join("\n"),
+                "application/x-camion-move": app.dragPayload,
                 "text/uri-list": app.dragUrls.join("\r\n")
             })
-            : ({ "application/x-camion-move": app.moving.join("\n") })
+            : ({ "application/x-camion-move": app.dragPayload })
     }
 
 
@@ -442,7 +442,7 @@ FocusScope {
 
         Shortcut {
             sequence: "Ctrl+V"
-            onActivated: app.moveInto(app.path)
+            onActivated: app.moveInto(app.dragPayload, app.path)
         }
 
         Shortcut {
@@ -491,6 +491,16 @@ FocusScope {
         DropArea {
             anchors.fill: parent
             keys: ["text/uri-list"]
+
+            /// Camion's own drags carry addresses as well, so that a file can be dropped onto
+            /// the desktop. Those addresses are not for us — a drag that started in Camion is a
+            /// move, wherever it started — so this declines them and the folder underneath
+            /// catches the drop instead of racing this for it.
+            onEntered: drag => {
+                if (drag.formats.indexOf("application/x-camion-move") !== -1) {
+                    drag.accepted = false
+                }
+            }
 
             onDropped: drop => app.dropUrls(drop.urls)
 

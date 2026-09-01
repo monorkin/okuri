@@ -2,7 +2,7 @@ mod signing;
 
 use async_trait::async_trait;
 use camion_core::{
-    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Serve,
     Served, Serving, Stored, Storing,
 };
 use futures::StreamExt;
@@ -215,6 +215,9 @@ impl AzureProvider {
     async fn upload_in_blocks(&self, path: &RemotePath, mut body: ByteStream) -> Result<()> {
         use base64::Engine as _;
 
+        // Taken before the body is read, because reading it is what consumes it.
+        let serve = body.serve().clone();
+
         let encoding = base64::engine::general_purpose::STANDARD;
         // Several blocks at once: the block list sent at the end is what puts them in order,
         // so they need not go up in order. Sending them one after another leaves the link idle
@@ -255,7 +258,7 @@ impl AzureProvider {
         // Set here rather than on the blocks: the block list is what makes the blob, and it is
         // the only request in a multipart upload that carries the blob's own headers.
         let mut headers = HeaderMap::new();
-        self.say_what_it_is(path, &mut headers)?;
+        self.say_what_it_is(path, &serve, &mut headers)?;
 
         let response = self
             .send(
@@ -278,14 +281,32 @@ impl AzureProvider {
 }
 
 impl AzureProvider {
-    /// Says what kind of thing is being uploaded.
+    /// Says what kind of thing is being uploaded, and how it should be handed out.
     ///
     /// Said at upload time because it cannot be said later without rewriting the blob — and a
     /// store told nothing serves `application/octet-stream` to everybody, which is the
     /// difference between a browser showing an image and downloading it.
-    fn say_what_it_is(&self, path: &RemotePath, headers: &mut HeaderMap) -> Result<()> {
-        if let Some(media) = path.name().and_then(media_type) {
-            headers.insert("x-ms-blob-content-type", header_value(media)?);
+    ///
+    /// What the source said comes first and the name is the fallback, because a file copied
+    /// from another store already knows what it is and may well have no extension to guess by.
+    fn say_what_it_is(
+        &self,
+        path: &RemotePath,
+        serve: &Serve,
+        headers: &mut HeaderMap,
+    ) -> Result<()> {
+        let serve = serve.or_guessed_from(path.name());
+
+        let said = [
+            ("x-ms-blob-content-type", serve.content_type),
+            ("x-ms-blob-cache-control", serve.cache_control),
+            ("x-ms-blob-content-encoding", serve.content_encoding),
+        ];
+
+        for (header, value) in said {
+            if let Some(value) = value {
+                headers.insert(header, header_value(&value)?);
+            }
         }
 
         Ok(())
@@ -441,11 +462,29 @@ impl Provider for AzureProvider {
         }
 
         let size = response.content_length();
+
+        // Taken from the answer already in hand rather than asked for again: this response is
+        // carrying it, and a file copied to another store arrives as what it is instead of as
+        // an octet stream.
+        let said = |header: &str| {
+            response
+                .headers()
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        let serve = Serve {
+            content_type: said("content-type"),
+            cache_control: said("cache-control"),
+            content_encoding: said("content-encoding"),
+        };
+
         let chunks = response.bytes_stream().map(|chunk| {
             chunk.map_err(|error| Error::caused_by("the download was interrupted", error))
         });
 
-        Ok(ByteStream::new(chunks, size))
+        Ok(ByteStream::new(chunks, size).served_as(serve))
     }
 
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
@@ -462,7 +501,7 @@ impl Provider for AzureProvider {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-ms-blob-type", header_value("BlockBlob")?);
-        self.say_what_it_is(path, &mut headers)?;
+        self.say_what_it_is(path, &body.serve().clone(), &mut headers)?;
 
         let response = self
             .send(

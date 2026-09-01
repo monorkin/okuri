@@ -41,6 +41,43 @@ above it:
   of them asking about something already answered.
 - **A new event that carries a session must be added to `Event::concern`.** Answering
   `Everyone` by default is how one window starts drawing another's files.
+- **A drag carries everything needed to act on it** (`Carried` in `screen.rs`, as the
+  `application/x-camion-move` payload): the session, the folder, and the names. It has to — a
+  drop can land in another window, and that window's `App` cannot ask the other one what was
+  picked up.
+
+## Dropping files from one window into another
+
+`Command::Move` names a connection at both ends and `Running::relocate` picks how:
+
+- **Same connection, even across two windows → `rename`.** Two windows on one saved connection
+  are two sessions to one machine, so the machine renames the file and both windows redraw.
+  Compare `Session::connection`, never `SessionId` — same-session is only the in-window case.
+- **Different connections → the bytes are carried**, and it is a *copy*: dragging between two
+  servers leaves the original where it was, the way dragging between two disks does. Taking
+  somebody's only copy off a server on the strength of a gesture is not something to do.
+
+The carry (`engine::carry`) hands the read stream straight to the write. Nothing touches the
+disk and nothing waits for a whole file, so a hundred-gigabyte object crosses in the memory of
+one chunk. Two things make it fast rather than merely correct, and both are easy to undo:
+
+- **The size goes across.** A destination told how big a file is writes it in one request; one
+  that is not has to split it or hold it to find out.
+- **A transfer between two servers holds a slot on both**, taken in `SessionId` order.
+  Both, because it is using both. In a fixed order, because files dragged both ways at once
+  would otherwise each hold the slot the other is waiting for.
+
+**Metadata travels on the `ByteStream`, not in a second request.** `read` fills in `Serve`
+(content type, cache control, content encoding) from the download response it already has, and
+`write` prefers it over guessing from the file name — which is the whole point, since the files
+that most need this are the ones with no extension to guess from. `counting` passes it through;
+anything else that rewraps a stream must too, or the type is silently lost. The Unix mode is the
+exception and rides on `Crossing`: no protocol puts it in a response, and it is set after the
+write, only where both ends have modes.
+
+What deliberately does *not* travel: ETag, storage class, encryption, version. Those describe
+where a file lives rather than what it is, and copying them to another store would be stating
+something untrue about it.
 
 **Adding a destination** is one file in `camion-providers` implementing `Provider`, one arm in
 `Destination`, and a conformance run. If it needs anything above it, something is wrong.

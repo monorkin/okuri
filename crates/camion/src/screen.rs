@@ -72,6 +72,47 @@ pub struct Screen {
     pub message_is_grave: bool,
 }
 
+/// What a drag is carrying, written down so it can travel.
+///
+/// A drag that leaves the window it started in arrives as mime data and nothing else: the window
+/// it lands in cannot ask the window it left what was picked up, and with the file list, the
+/// breadcrumb and another window all being places to drop, no one of them can hold the answer
+/// either. So everything needed to act on a drop goes with the drop — which connection the
+/// files are on, which folder they are in, and what they are called.
+///
+/// Three lines and then the names, because a drag carries text and this is the shape that
+/// survives the trip without inventing a format anybody has to look up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub session: SessionId,
+    pub folder: RemotePath,
+    pub names: Vec<String>,
+}
+
+impl Carried {
+    pub fn payload(&self) -> String {
+        let mut lines = vec![self.session.0.to_string(), self.folder.to_string()];
+        lines.extend(self.names.iter().cloned());
+
+        lines.join("\n")
+    }
+
+    /// Reads back what [`Carried::payload`] wrote, or nothing if this drag came from somewhere
+    /// that is not Camion.
+    pub fn parse(payload: &str) -> Option<Self> {
+        let mut lines = payload.split('\n');
+
+        let session = SessionId(lines.next()?.parse().ok()?);
+        let folder = RemotePath::parse(lines.next()?).ok()?;
+        let names = lines.map(str::to_owned).filter(|name| !name.is_empty()).collect::<Vec<_>>();
+
+        match names.is_empty() {
+            true => None,
+            false => Some(Self { session, folder, names }),
+        }
+    }
+}
+
 /// What one file turned out to be, as the destinations that know each part answered.
 #[derive(Clone, Debug, Default)]
 pub struct Described {
@@ -494,6 +535,33 @@ mod tests {
 
         assert!(ours.connecting);
         assert_eq!(ours.message, "");
+    }
+
+    /// A drag that leaves its window arrives as text and nothing else, so everything needed to
+    /// act on it has to survive the round trip.
+    #[test]
+    fn what_a_drag_carries_survives_leaving_the_window() {
+        let carried = Carried {
+            session: SessionId(7),
+            folder: RemotePath::parse("/documents/invoices").unwrap(),
+            names: vec!["2026-08.pdf".to_owned(), "notes.txt".to_owned()],
+        };
+
+        assert_eq!(Carried::parse(&carried.payload()), Some(carried));
+    }
+
+    /// Anything else dropped on Camion is not Camion's to move. A drop that cannot be read is
+    /// worth saying so about, which it cannot be if an unreadable one looks like an empty one.
+    #[test]
+    fn a_drop_from_somewhere_else_carries_nothing() {
+        assert_eq!(Carried::parse(""), None);
+        assert_eq!(Carried::parse("file:///home/me/harbour.jpg"), None);
+
+        // A connection and a folder, and nothing being carried between them.
+        assert_eq!(Carried::parse("7\n/documents"), None);
+
+        // A connection and nothing else.
+        assert_eq!(Carried::parse("7"), None);
     }
 
     /// A config file that will not parse belongs to nobody in particular, and a window that

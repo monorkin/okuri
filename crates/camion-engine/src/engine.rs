@@ -13,7 +13,7 @@ use crate::event::{Answer, Attempt, Concern, Event, Outcome, Prompt, Question};
 use crate::known_hosts::KnownHosts;
 use crate::secrets::{SecretStore, Vault};
 use crate::session::{Session, SessionId};
-use crate::transfer::{counting, Endpoint, Transfer, TransferId};
+use crate::transfer::{counting, Endpoint, Place, Transfer, TransferId};
 use crate::trust::PromptingTrust;
 use crate::{Emitter, Error, Result};
 
@@ -38,12 +38,16 @@ pub enum Command {
     CreateFolder { session: SessionId, name: String },
     Rename { session: SessionId, from: String, to: String },
 
-    /// Moves files between two folders on the same connection.
+    /// Puts files somewhere else.
     ///
     /// Where they came from is stated rather than assumed to be whatever is open: a move can be
     /// asked for in one folder and completed in another, which is exactly what cutting and
     /// pasting is, and what dragging somewhere else amounts to.
-    Move { session: SessionId, from: RemotePath, names: Vec<String>, into: RemotePath },
+    ///
+    /// Both ends name a connection as well as a folder, because a drag can now leave the window
+    /// it started in. Whether that means renaming the files or carrying their bytes across is
+    /// the engine's to work out — see [`Running::relocate`].
+    Move { from: Place, names: Vec<String>, into: Place },
     Delete { session: SessionId, names: Vec<String> },
 
     /// Asks for everything else the destination knows about one file.
@@ -80,7 +84,6 @@ impl Command {
             | Self::Open { session, .. }
             | Self::CreateFolder { session, .. }
             | Self::Rename { session, .. }
-            | Self::Move { session, .. }
             | Self::Delete { session, .. }
             | Self::Describe { session, .. }
             | Self::SetPermissions { session, .. }
@@ -89,6 +92,10 @@ impl Command {
             | Self::Reshare { session, .. }
             | Self::Upload { session, .. }
             | Self::Download { session, .. } => Concern::Session(*session),
+
+            // The window dropped into, not the one dragged from. It is the one being looked at,
+            // and it is the one that ends up wrong if this does not work.
+            Self::Move { into, .. } => Concern::Session(into.session),
 
             Self::CancelTransfer(_) => Concern::Everyone,
         }
@@ -182,8 +189,8 @@ impl Running {
             Command::Refresh(session) => self.refresh(session).await,
             Command::CreateFolder { session, name } => self.create_folder(session, &name).await,
             Command::Rename { session, from, to } => self.rename(session, &from, &to).await,
-            Command::Move { session, from, names, into } => {
-                self.move_to(session, from, names, into).await
+            Command::Move { from, names, into } => {
+                self.relocate(from, names, into).await
             }
             Command::Delete { session, names } => self.delete(session, names).await,
             Command::Upload { session, into, sources } => {
@@ -620,41 +627,184 @@ impl Running {
         self.open(id, folder).await
     }
 
-    /// Moves files into another folder on the same connection.
+    /// Puts files somewhere else, by whichever means the two ends allow.
     ///
-    /// A rename with a different parent, which is exactly what a move is — so an object store
-    /// copies and deletes, and says so beforehand through its capabilities, the same as it does
-    /// for a rename in place.
-    async fn move_to(
-        &self,
-        id: SessionId,
-        from: RemotePath,
+    /// The two cases are genuinely different work and the difference is not which window the
+    /// files were dragged from — it is which *server* they are on. Two windows open on the same
+    /// saved connection are two sessions to one machine, and asking that machine to rename a
+    /// file is right whichever of the two windows asked. Two different machines share nothing,
+    /// and the bytes have to travel.
+    async fn relocate(
+        self: &Arc<Self>,
+        from: Place,
         names: Vec<String>,
-        into: RemotePath,
+        into: Place,
     ) -> Result<()> {
-        let session = self.session(id)?;
+        let source = self.session(from.session)?;
+        let target = self.session(into.session)?;
 
-        if into == from {
+        for name in &names {
+            // Moving a folder inside itself would take the tree with it. Only ever possible on
+            // one server, since two of them share no paths. The provider refuses this too, but
+            // saying so here means the same words whichever destination it is.
+            if source.connection == target.connection && into.path.starts_with(&from.path.join(name)?) {
+                return Err(Error::config(format!("{name} cannot be moved inside itself")));
+            }
+        }
+
+        if source.connection == target.connection {
+            self.rename_into(&source, &from, names, &into).await?;
+        } else {
+            self.carry_across(&source, &from, names, &target, &into).await?;
+        }
+
+        Ok(())
+    }
+
+    /// The same server, so the files never move: only what they are called does.
+    ///
+    /// Both connections are redrawn rather than only the one dropped into. They are two views
+    /// of one machine, and a file that has left the folder the other window is looking at has
+    /// left it whether or not that window was told.
+    async fn rename_into(
+        &self,
+        source: &Arc<Session>,
+        from: &Place,
+        names: Vec<String>,
+        into: &Place,
+    ) -> Result<()> {
+        if into.path == from.path {
             return Ok(());
         }
 
         for name in names {
-            let from = from.join(&name)?;
-
-            // Moving a folder inside itself would take the tree with it. The provider refuses
-            // this too, but saying so here means the same words whichever destination it is.
-            if into.starts_with(&from) {
-                return Err(Error::config(format!(
-                    "{name} cannot be moved inside itself"
-                )));
-            }
-
-            session.provider.rename(&from, &into.join(&name)?).await?;
+            source
+                .provider
+                .rename(&from.path.join(&name)?, &into.path.join(&name)?)
+                .await?;
         }
 
-        // Whichever folder is open now is the one that has to be redrawn — it may be the one
-        // they left, the one they arrived in, or neither.
-        self.refresh(id).await
+        self.refresh(from.session).await?;
+
+        if into.session != from.session {
+            self.refresh(into.session).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Two different servers, so the bytes have to travel.
+    ///
+    /// A copy rather than a move, the way dragging between two disks is a copy: the file is
+    /// still on the machine it came from, and taking it away would mean deleting somebody's
+    /// only copy on the strength of a gesture that can be made by accident.
+    ///
+    /// The source folder is left alone and only the destination is redrawn, which
+    /// [`Running::start`] does once the last file has landed.
+    async fn carry_across(
+        self: &Arc<Self>,
+        source: &Arc<Session>,
+        from: &Place,
+        names: Vec<String>,
+        target: &Arc<Session>,
+        into: &Place,
+    ) -> Result<()> {
+        // What is already there, asked once for the whole drop rather than once per file, for
+        // the same reason an upload asks once: a miss costs a round trip and there may be
+        // thousands of them before a single byte moves.
+        let mut taken = target
+            .provider
+            .list(&into.path)
+            .await?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<std::collections::HashSet<String>>();
+
+        let mut files = Vec::new();
+
+        for name in names {
+            let Some(arriving) = self.arriving_as(into.session, name.clone(), &taken).await? else {
+                continue;
+            };
+
+            taken.insert(arriving.clone());
+
+            self.spread(
+                source,
+                from.path.join(&name)?,
+                target,
+                into.path.join(&arriving)?,
+                &mut files,
+            )
+            .await?;
+        }
+
+        for file in files {
+            let (at, to) = (file.from.clone(), file.to.clone());
+
+            let mut transfer = Transfer::new(
+                Endpoint::Remote { session: source.id, path: at.clone() },
+                Endpoint::Remote { session: target.id, path: to.clone() },
+            );
+
+            transfer.total = file.size;
+
+            let (reading, writing) = (Arc::clone(source), Arc::clone(target));
+
+            self.start(transfer, &[Arc::clone(source), Arc::clone(target)], move |progress| {
+                carry(reading, at, writing, to, file, progress)
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Walks the source tree, making the folders on the far side, and collects the files.
+    ///
+    /// A folder is not a thing that can be transferred, it is a shape. The folders are made
+    /// even where they turn out to hold nothing, so an empty one still arrives — the same
+    /// promise downloading a folder makes.
+    async fn spread(
+        &self,
+        source: &Arc<Session>,
+        at: RemotePath,
+        target: &Arc<Session>,
+        to: RemotePath,
+        files: &mut Vec<Crossing>,
+    ) -> Result<()> {
+        let entry = source.provider.stat(&at).await?;
+
+        if entry.kind.is_file() {
+            files.push(Crossing {
+                permissions: entry.permissions,
+                from: at,
+                to,
+                size: Some(entry.size),
+            });
+
+            return Ok(());
+        }
+
+        // Already being there is the state this is asking for, so it is not a failure. Replacing
+        // a folder is what the person answered "replace" to, and the files inside it are what
+        // actually get replaced.
+        match target.provider.create_folder(&to).await {
+            Ok(()) | Err(camion_core::Error::AlreadyExists { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        for child in source.provider.list(&at).await? {
+            Box::pin(self.spread(
+                source,
+                at.join(&child.name)?,
+                target,
+                to.join(&child.name)?,
+                files,
+            ))
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn delete(&self, id: SessionId, names: Vec<String>) -> Result<()> {
@@ -720,8 +870,10 @@ impl Running {
 
             transfer.total = size;
 
-            self.start(transfer, Arc::clone(&session), move |session, progress| {
-                send_up(session, source, destination, size, progress)
+            let writing = Arc::clone(&session);
+
+            self.start(transfer, std::slice::from_ref(&session), move |progress| {
+                send_up(writing, source, destination, size, progress)
             });
         }
 
@@ -773,8 +925,10 @@ impl Running {
 
             transfer.total = file.size;
 
-            self.start(transfer, Arc::clone(&session), move |session, progress| {
-                bring_down(session, source, destination, progress)
+            let reading = Arc::clone(&session);
+
+            self.start(transfer, std::slice::from_ref(&session), move |progress| {
+                bring_down(reading, source, destination, progress)
             });
         }
 
@@ -843,17 +997,35 @@ impl Running {
     fn start<Work, Run>(
         self: &Arc<Self>,
         transfer: Transfer,
-        session: Arc<Session>,
+        holding: &[Arc<Session>],
         work: Work,
     ) -> tokio::task::JoinHandle<Outcome>
     where
-        Work: FnOnce(Arc<Session>, Progress) -> Run + Send + 'static,
+        Work: FnOnce(Progress) -> Run + Send + 'static,
         Run: std::future::Future<Output = Result<()>> + Send,
     {
         let id = transfer.id;
         let engine = Arc::clone(self);
-        let slots = session.transfer_slots();
-        let on = session.id;
+
+        // Every transfer has a connection at one end — nothing here moves a local file to
+        // another local file — and this is the one whose folder is about to change.
+        let on = transfer.session().expect("a transfer with a connection at one end");
+
+        // A slot on every connection this occupies, taken in a fixed order.
+        //
+        // Both, for a transfer between two servers: it is using both, and counting only one end
+        // lets a fast server flood a slow one through a queue that thinks it is idle. The order
+        // is by connection rather than by which end is which, so files being dragged both ways
+        // at once cannot each hold the slot the other is waiting for.
+        let mut slots = holding
+            .iter()
+            .map(|session| (session.id, session.transfer_slots()))
+            .collect::<Vec<_>>();
+
+        slots.sort_by_key(|(session, _)| *session);
+        slots.dedup_by_key(|(session, _)| *session);
+
+        let slots = slots.into_iter().map(|(_, slots)| slots).collect::<Vec<_>>();
 
         // A download changes nothing on the server, so only work that lands there is worth
         // looking at the folder again for.
@@ -862,14 +1034,18 @@ impl Running {
         self.emit(Event::TransferAdded(transfer));
 
         let task = tokio::spawn(async move {
-            let _slot = slots.acquire().await;
+            let mut held = Vec::with_capacity(slots.len());
+
+            for slot in &slots {
+                held.push(slot.acquire().await);
+            }
 
             let reporter = Arc::clone(&engine);
             let progress: Progress = Arc::new(move |transferred| {
                 reporter.emit(Event::TransferProgress { transfer: id, transferred });
             });
 
-            let outcome = match work(session, progress).await {
+            let outcome = match work(progress).await {
                 Ok(()) => Outcome::Done,
                 Err(error) => Outcome::Failed(error.to_string()),
             };
@@ -934,6 +1110,26 @@ fn beside(name: &str, taken: &std::collections::HashSet<String>) -> String {
     }
 }
 
+/// One file on its way from one server to another, and everything worth taking with it.
+///
+/// What travels is what describes the file: how big it is, what it is, how it was encoded, and
+/// who may do what with it. What does not travel is what describes where it lives — an ETag, a
+/// storage class, a version. Those belong to the store that made them, and copying them to
+/// another store would be stating something untrue about it.
+struct Crossing {
+    from: RemotePath,
+    to: RemotePath,
+    size: Option<u64>,
+
+    /// The mode, where the source has one. Losing it turns a script into a file that will not
+    /// run, and there is nothing on the far side to tell you it used to.
+    ///
+    /// Carried here rather than read off the download the way the content type is, because no
+    /// protocol puts a Unix mode in a response body — it comes from the listing, which has
+    /// already been asked for.
+    permissions: Option<Permissions>,
+}
+
 /// One file that has to come down, and where it goes.
 struct Planned {
     source: RemotePath,
@@ -982,6 +1178,48 @@ async fn send_up(
     });
 
     Ok(session.provider.write(&destination, body).await?)
+}
+
+/// Moves one file from one server straight to another.
+///
+/// Nothing touches the disk and nothing waits for the whole file. The read stream is handed to
+/// the write, so a chunk arrives from one connection and leaves on the other, and what is held
+/// at any moment is a chunk rather than a file. A hundred-gigabyte object crosses in as much
+/// memory as a small one.
+///
+/// The size goes across with it, and that matters more than it looks: a destination told how
+/// big a file is can write it in a single request, while one that is not has to split it into
+/// parts or hold it to find out.
+async fn carry(
+    source: Arc<Session>,
+    at: RemotePath,
+    target: Arc<Session>,
+    to: RemotePath,
+    file: Crossing,
+    progress: Progress,
+) -> Result<()> {
+    let stream = source.provider.read(&at, None).await?;
+    let known = stream.size().or(file.size);
+
+    // What the source said about the file, which the download response has already told us.
+    // Asking the source again would be a round trip per file for something in hand.
+    let serve = stream.serve().clone();
+
+    let body = counting(
+        ByteStream::new(stream, known).served_as(serve),
+        move |transferred| progress(transferred),
+    );
+
+    target.provider.write(&to, body).await?;
+
+    // Afterwards, because a file has to exist before its mode can be set, and only where both
+    // ends have one — an object store has no modes and an SFTP server has nothing else.
+    if let (Some(permissions), Some(permitting)) = (file.permissions, target.provider.permitting())
+    {
+        permitting.set_permissions(&to, permissions).await?;
+    }
+
+    Ok(())
 }
 
 async fn bring_down(

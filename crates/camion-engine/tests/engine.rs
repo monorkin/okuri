@@ -7,6 +7,7 @@ use camion_core::RemotePath;
 use camion_engine::engine::Command;
 use camion_engine::event::Outcome;
 use camion_engine::secrets::{InMemory, SecretStore};
+use camion_engine::transfer::Place;
 use camion_engine::{
     Answer, Attempt, Concern, Connection, Emitter, Engine, Event, SessionId, Vault,
 };
@@ -296,10 +297,9 @@ fn moving_a_file_into_a_folder_takes_it_out_of_this_one() {
     watcher.wait_for_listing("/");
 
     engine.send(Command::Move {
-        session,
-        from: RemotePath::root(),
+        from: Place::new(session, RemotePath::root()),
         names: vec!["README.md".to_owned()],
-        into: RemotePath::parse("/documents").unwrap(),
+        into: Place::new(session, RemotePath::parse("/documents").unwrap()),
     });
 
     let here = watcher.wait_for(|event| match event {
@@ -320,10 +320,9 @@ fn a_folder_cannot_be_moved_into_itself() {
     watcher.wait_for_listing("/");
 
     engine.send(Command::Move {
-        session,
-        from: RemotePath::root(),
+        from: Place::new(session, RemotePath::root()),
         names: vec!["documents".to_owned()],
-        into: RemotePath::parse("/documents/invoices").unwrap(),
+        into: Place::new(session, RemotePath::parse("/documents/invoices").unwrap()),
     });
 
     let message = watcher.wait_for(|event| match event {
@@ -346,10 +345,9 @@ fn files_can_be_moved_after_navigating_away_from_them() {
     watcher.wait_for_listing("/photos");
 
     engine.send(Command::Move {
-        session,
-        from: RemotePath::root(),
+        from: Place::new(session, RemotePath::root()),
         names: vec!["README.md".to_owned()],
-        into: RemotePath::parse("/photos").unwrap(),
+        into: Place::new(session, RemotePath::parse("/photos").unwrap()),
     });
 
     let arrived = watcher.wait_for(|event| match event {
@@ -823,4 +821,165 @@ fn a_question_says_which_connection_it_is_holding_up() {
     asked.sort_by_key(|concern| format!("{concern:?}"));
 
     assert_eq!(asked, vec![Concern::Attempt(ours), Concern::Attempt(theirs)]);
+}
+
+/// Two windows, two connections, both on the same in-memory destination.
+///
+/// A second connection rather than a second session on the first: what makes a drop a copy
+/// rather than a rename is that the two ends are different servers, and two `Connection`s are
+/// the only way to say that.
+fn two_connections() -> (Engine, Watcher, SessionId, SessionId) {
+    let (watcher, emit) = Watcher::new();
+    let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
+
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new("Scratch", Destination::Memory)),
+    });
+
+    let here = watcher.wait_for_session();
+
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(Connection::new("Elsewhere", Destination::Memory)),
+    });
+
+    let there = watcher.wait_for_session();
+
+    (engine, watcher, here, there)
+}
+
+/// Dragging a file from one window into another, where the two are on different servers. The
+/// bytes have to cross, and they cross without ever being on this machine.
+#[test]
+fn a_file_dropped_on_another_connection_is_carried_across() {
+    let (engine, watcher, here, there) = two_connections();
+
+    // The window being dropped into is looking at the folder being dropped into, which is what
+    // makes it that folder. Redrawing after a drop means redrawing what that window has open.
+    engine.send(Command::Open {
+        session: there,
+        path: RemotePath::parse("/documents").unwrap(),
+    });
+    watcher.wait_for_listing("/documents");
+
+    engine.send(Command::Move {
+        from: Place::new(here, RemotePath::root()),
+        names: vec!["README.md".to_owned()],
+        into: Place::new(there, RemotePath::parse("/documents").unwrap()),
+    });
+
+    let queued = watcher.wait_for(|event| match event {
+        Event::TransferAdded(transfer) => Some(transfer),
+        _ => None,
+    });
+
+    assert_eq!(queued.direction, camion_engine::transfer::Direction::Between);
+    assert_eq!(queued.name, "README.md");
+    assert_eq!(queued.total, Some(14));
+
+    let outcome = watcher.wait_for(|event| match event {
+        Event::TransferFinished { outcome, .. } => Some(outcome),
+        _ => None,
+    });
+    assert_eq!(outcome, Outcome::Done);
+
+    // The window dropped into redraws itself, the same as it does for a file dropped in from
+    // the desktop. Having to press refresh to see what you just dragged in is the thing this
+    // application exists not to do.
+    let mut arrived = watcher.wait_for(|event| match event {
+        Event::Listing { session, path, entries }
+            if session == there && path == RemotePath::parse("/documents").unwrap() =>
+        {
+            Some(entries.into_iter().map(|entry| entry.name).collect::<Vec<_>>())
+        }
+        _ => None,
+    });
+    arrived.sort();
+
+    assert_eq!(arrived, vec!["README.md", "invoices", "notes.txt"]);
+
+    // Copied, not moved. Taking somebody's only copy off the server it was on is not something
+    // a gesture that can be made by accident should do.
+    engine.send(Command::Refresh(here));
+    assert!(watcher.wait_for_listing("/").contains(&"README.md".to_owned()));
+}
+
+/// A folder is a shape rather than a thing that can be transferred, so it is walked: the
+/// folders are made on the far side and every file inside crosses on its own.
+#[test]
+fn a_folder_dropped_on_another_connection_arrives_with_its_tree_intact() {
+    let (engine, watcher, here, there) = two_connections();
+
+    engine.send(Command::Move {
+        from: Place::new(here, RemotePath::root()),
+        names: vec!["documents".to_owned()],
+        into: Place::new(there, RemotePath::parse("/photos").unwrap()),
+    });
+
+    let mut landed = 0;
+    watcher.wait_for(|event| match event {
+        Event::TransferFinished { outcome: Outcome::Done, .. } => {
+            landed += 1;
+            (landed == 2).then_some(())
+        }
+        Event::TransferFinished { outcome, .. } => panic!("a file did not arrive: {outcome:?}"),
+        _ => None,
+    });
+
+    engine.send(Command::Open {
+        session: there,
+        path: RemotePath::parse("/photos/documents/invoices").unwrap(),
+    });
+
+    assert_eq!(
+        watcher.wait_for_listing("/photos/documents/invoices"),
+        vec!["2026-08.pdf"]
+    );
+}
+
+/// Two windows open on the *same* saved connection are two sessions onto one machine, and
+/// asking that machine to rename a file is right whichever of them the drag started in. Copying
+/// the bytes out and back would be the same file taking a round trip through this process for
+/// no reason at all.
+#[test]
+fn a_file_dropped_on_the_same_connection_is_renamed_rather_than_copied() {
+    let (watcher, emit) = Watcher::new();
+    let engine = Engine::start(Arc::new(Vault::open(Arc::new(InMemory::default()))), emit);
+
+    let connection = Connection::new("Scratch", Destination::Memory);
+
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(connection.clone()),
+    });
+    let here = watcher.wait_for_session();
+
+    engine.send(Command::Connect {
+        attempt: Attempt::next(),
+        connection: Box::new(connection),
+    });
+    let alongside = watcher.wait_for_session();
+
+    engine.send(Command::Move {
+        from: Place::new(here, RemotePath::root()),
+        names: vec!["README.md".to_owned()],
+        into: Place::new(alongside, RemotePath::parse("/documents").unwrap()),
+    });
+
+    // Whichever of these arrives first is the answer: a rename says so by the file leaving the
+    // folder it was in, and a copy says so by queueing a transfer.
+    let copied = watcher.wait_for(|event| match event {
+        Event::TransferAdded(_) => Some(true),
+        Event::Listing { session, path, entries }
+            if session == here
+                && path == RemotePath::root()
+                && !entries.iter().any(|entry| entry.name == "README.md") =>
+        {
+            Some(false)
+        }
+        _ => None,
+    });
+
+    assert!(!copied, "a move within one connection carried the bytes instead of renaming");
 }

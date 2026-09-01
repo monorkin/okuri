@@ -13,7 +13,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use camion_core::{
-    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Serve,
     Served, Serving, Sharing, Stored, Storing, Visibility,
 };
 use futures::StreamExt;
@@ -189,7 +189,7 @@ impl S3Provider {
     async fn upload_in_parts(
         &self,
         key: &str,
-        media: Option<&str>,
+        serve: &Serve,
         mut body: ByteStream,
     ) -> Result<()> {
         let started = self
@@ -197,7 +197,9 @@ impl S3Provider {
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
-            .set_content_type(media.map(str::to_owned))
+            .set_content_type(serve.content_type.clone())
+            .set_cache_control(serve.cache_control.clone())
+            .set_content_encoding(serve.content_encoding.clone())
             .send()
             .await
             .map_err(|error| failed("could not begin the upload", error))?;
@@ -547,11 +549,21 @@ impl Provider for S3Provider {
             .map_err(|error| missing_or_refused(error, path))?;
 
         let size = object.content_length().map(|length| length as u64);
+
+        // What the store says this is, taken from the answer already in hand. Asking again
+        // afterwards would be a second round trip for something this response is carrying, and
+        // it is what stops a file copied somewhere else arriving as an octet stream.
+        let serve = Serve {
+            content_type: object.content_type().map(str::to_owned),
+            cache_control: object.cache_control().map(str::to_owned),
+            content_encoding: object.content_encoding().map(str::to_owned),
+        };
+
         let chunks = tokio_util::io::ReaderStream::new(object.body.into_async_read()).map(|chunk| {
             chunk.map_err(|error| Error::caused_by("the download was interrupted", error))
         });
 
-        Ok(ByteStream::new(chunks, size))
+        Ok(ByteStream::new(chunks, size).served_as(serve))
     }
 
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
@@ -560,7 +572,11 @@ impl Provider for S3Provider {
         // Said at upload time, because it cannot be said later without rewriting the object —
         // and a store told nothing answers `application/octet-stream` to everybody, which is
         // the difference between a browser showing an image and downloading it.
-        let media = path.name().and_then(media_type);
+        //
+        // What the source said comes first and the name is the fallback. A file copied from
+        // another store already knows what it is, and plenty of files worth serving have no
+        // extension to guess from.
+        let serve = body.serve().or_guessed_from(path.name());
 
         // A small file is one request; anything bigger is split, so a large upload never has to
         // be held in memory all at once.
@@ -572,7 +588,9 @@ impl Provider for S3Provider {
                     .put_object()
                     .bucket(&self.bucket)
                     .key(key)
-                    .set_content_type(media.map(str::to_owned))
+                    .set_content_type(serve.content_type.clone())
+                    .set_cache_control(serve.cache_control.clone())
+                    .set_content_encoding(serve.content_encoding.clone())
                     .body(AwsStream::from(bytes))
                     .send()
                     .await
@@ -580,7 +598,7 @@ impl Provider for S3Provider {
 
                 Ok(())
             }
-            _ => self.upload_in_parts(&key, media, body).await,
+            _ => self.upload_in_parts(&key, &serve, body).await,
         }
     }
 

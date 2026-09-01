@@ -32,9 +32,11 @@ DropArea {
     onEntered: if (opens) waiting.restart()
     onExited: waiting.stop()
 
-    onDropped: {
+    // What the drop is carrying comes from the drop, not from this window: it may have been
+    // picked up in another one, whose `App` this is not.
+    onDropped: drop => {
         waiting.stop()
-        app.moveInto(spring.folder)
+        app.moveInto(drop.getDataAsString("application/x-camion-move"), spring.folder)
     }
 
     Timer {

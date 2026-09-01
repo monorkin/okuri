@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use camion_core::{
-    media_type, ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result,
+    ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Serve,
     Served, Serving,
 };
 use futures::StreamExt;
@@ -134,6 +134,22 @@ impl WebDavProvider {
     }
 }
 
+/// The serving headers of a response, for the two places that read them.
+fn served_from(headers: &reqwest::header::HeaderMap) -> Serve {
+    let said = |header: &str| {
+        headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    Serve {
+        content_type: said("content-type"),
+        cache_control: said("cache-control"),
+        content_encoding: said("content-encoding"),
+    }
+}
+
 #[async_trait]
 impl Serving for WebDavProvider {
     /// Whatever the web server chose to serve the file as, which is all WebDAV has to say.
@@ -146,19 +162,18 @@ impl Serving for WebDavProvider {
 
         expect_success(response.status(), path, "read the file's details")?;
 
-        let said = |header: &str| {
-            response
-                .headers()
-                .get(header)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
+        let serve = served_from(response.headers());
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(|tag| tag.trim_matches('"').to_owned());
 
         Ok(Served {
-            content_type: said("content-type"),
-            etag: said("etag").map(|tag| tag.trim_matches('"').to_owned()),
-            cache_control: said("cache-control"),
-            content_encoding: said("content-encoding"),
+            content_type: serve.content_type,
+            etag,
+            cache_control: serve.cache_control,
+            content_encoding: serve.content_encoding,
         })
     }
 }
@@ -227,11 +242,13 @@ impl Provider for WebDavProvider {
         }
 
         let size = response.content_length();
+        let serve = served_from(response.headers());
+
         let chunks = response.bytes_stream().map(|chunk| {
             chunk.map_err(|error| Error::caused_by("the download was interrupted", error))
         });
 
-        Ok(ByteStream::new(chunks, size))
+        Ok(ByteStream::new(chunks, size).served_as(serve))
     }
 
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()> {
@@ -244,9 +261,21 @@ impl Provider for WebDavProvider {
             request = request.header(reqwest::header::CONTENT_LENGTH, size);
         }
 
-        // And what it is, which is what the server will serve it back as.
-        if let Some(media) = path.name().and_then(media_type) {
+        // And what it is, which is what the server will serve it back as. What the source said
+        // comes first; the name is only a guess, and one that a file with no extension cannot
+        // be made from at all.
+        let serve = body.serve().or_guessed_from(path.name());
+
+        if let Some(media) = &serve.content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, media);
+        }
+
+        if let Some(encoding) = &serve.content_encoding {
+            request = request.header(reqwest::header::CONTENT_ENCODING, encoding);
+        }
+
+        if let Some(cache) = &serve.cache_control {
+            request = request.header(reqwest::header::CACHE_CONTROL, cache);
         }
 
         let response = request

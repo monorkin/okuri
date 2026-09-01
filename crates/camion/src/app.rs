@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use camion_core::RemotePath;
 
-use crate::screen::Screen;
+use crate::screen::{Carried, Screen};
 use camion_engine::engine::Command;
+use camion_engine::transfer::Place;
 use camion_engine::{Answer, Attempt, Event, Question, SessionId};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QString, QStringList};
@@ -79,13 +80,13 @@ pub mod qobject {
         #[qproperty(bool, message_is_grave)]
         /// Where the files being dragged live, for whatever they are dropped on.
         #[qproperty(QStringList, drag_urls)]
-        /// What a drag inside the window is carrying. Held here rather than in one corner of
-        /// the interface, because the folder rows and the breadcrumb are both places to drop
-        /// it and neither owns the other.
-        #[qproperty(QStringList, moving)]
-        /// The folder the drag started in. Held because it can be navigated away from before
-        /// the files are put down, which is what makes the breadcrumb useful mid-drag.
-        #[qproperty(QString, moving_from)]
+        /// What a drag is carrying, as the text it carries it in.
+        ///
+        /// Goes into the drag itself rather than being read back off this object when a drop
+        /// lands, because a drop can land in another window — and that window cannot ask this
+        /// one what was picked up. Kept here so the drag can be handed it, and so pasting,
+        /// which has no drop to read, has somewhere to get it from.
+        #[qproperty(QString, drag_payload)]
         #[qproperty(bool, asking)]
         #[qproperty(QString, question_title)]
         #[qproperty(QString, question_body)]
@@ -159,9 +160,13 @@ pub mod qobject {
         #[qinvokable]
         fn begin_move(self: Pin<&mut App>, names: QStringList);
 
-        /// Moves whatever is being dragged into a folder on the same connection.
+        /// Puts what a drop is carrying into a folder on this window's connection.
+        ///
+        /// The payload comes from the drop itself, because the drag may have started in another
+        /// window. Whether that means renaming the files or carrying their bytes across is the
+        /// engine's to decide from the two connections.
         #[qinvokable]
-        fn move_into(self: Pin<&mut App>, folder: QString);
+        fn move_into(self: Pin<&mut App>, payload: QString, folder: QString);
 
         #[qinvokable]
         fn end_move(self: Pin<&mut App>);
@@ -202,8 +207,7 @@ pub struct AppRust {
     message: QString,
     message_is_grave: bool,
     drag_urls: QStringList,
-    moving: QStringList,
-    moving_from: QString,
+    drag_payload: QString,
     asking: bool,
     question_title: QString,
     question_body: QString,
@@ -258,8 +262,7 @@ impl Default for AppRust {
             message: QString::default(),
             message_is_grave: true,
             drag_urls: QStringList::default(),
-            moving: QStringList::default(),
-            moving_from: QString::default(),
+            drag_payload: QString::default(),
             asking: false,
             question_title: QString::default(),
             question_body: QString::default(),
@@ -476,46 +479,61 @@ impl qobject::App {
         self.command(move |session| Command::Download { session, names, into });
     }
 
-    pub fn begin_move(mut self: Pin<&mut Self>, names: QStringList) {
-        let folder = QString::from(&self.rust().screen.folder.to_string());
-
-        // Worked out now rather than when the pointer reaches the edge: a drag that leaves the
-        // window is taken over by the desktop, and by then there is no chance to add anything
-        // to what it carries.
-        let urls = self
-            .remote_urls(&strings(&names))
-            .unwrap_or_default();
-
-        self.as_mut().set_drag_urls(urls);
-        self.as_mut().set_moving_from(folder);
-        self.as_mut().set_moving(names);
-    }
-
-    /// Puts what is being dragged into `folder`.
+    /// Writes down what is being dragged, for the drag to carry.
     ///
-    /// A drop is offered to more than one target, and a target that cannot say where it is has
-    /// to leave what is being carried alone — the next one to see the same drop is the one that
-    /// meant something. So nothing is cleared until this drop is actually being acted on.
-    pub fn move_into(mut self: Pin<&mut Self>, folder: QString) {
-        let names = strings(&self.moving().clone());
-        let source = self.moving_from().to_string();
-        let target = folder.to_string();
-
-        let (Ok(into), Ok(from)) = (RemotePath::parse(&target), RemotePath::parse(&source)) else {
+    /// Worked out now rather than when the pointer reaches the edge: a drag that leaves the
+    /// window is taken over by the desktop, and by then there is no chance to add anything to
+    /// what it carries — including the answer to which window it came from.
+    pub fn begin_move(mut self: Pin<&mut Self>, names: QStringList) {
+        let Some(session) = self.rust().screen.session else {
             return;
         };
 
-        self.as_mut().set_moving(QStringList::default());
+        let names = strings(&names);
+        let urls = self.remote_urls(&names).unwrap_or_default();
 
-        if names.is_empty() {
+        let carried = Carried {
+            session,
+            folder: self.rust().screen.folder.clone(),
+            names,
+        };
+
+        self.as_mut().set_drag_urls(urls);
+        self.as_mut().set_drag_payload(QString::from(&carried.payload()));
+    }
+
+    /// Puts whatever `payload` describes into `folder` on this window's connection.
+    ///
+    /// What is being moved comes from the drop rather than from this object, because the drop
+    /// may have started in another window — and that window's `App` is not this one. It is also
+    /// what makes a drop safe to offer to several targets at once: nothing is being consumed,
+    /// so a target that turns out not to be the one meant leaves nothing missing behind it.
+    pub fn move_into(mut self: Pin<&mut Self>, payload: QString, folder: QString) {
+        let Some(session) = self.rust().screen.session else {
             return;
-        }
+        };
 
-        self.command(move |session| Command::Move { session, from, names, into });
+        let Some(carried) = Carried::parse(&payload.to_string()) else {
+            self.as_mut()
+                .complain("that drop did not say what it was carrying");
+            return;
+        };
+
+        let Ok(path) = RemotePath::parse(&folder.to_string()) else {
+            self.as_mut()
+                .complain(format!("{folder} is not a folder this connection has"));
+            return;
+        };
+
+        let from = Place::new(carried.session, carried.folder);
+        let into = Place::new(session, path);
+
+        crate::running::engine().send(Command::Move { from, names: carried.names, into });
     }
 
     pub fn end_move(mut self: Pin<&mut Self>) {
-        self.as_mut().set_moving(QStringList::default());
+        self.as_mut().set_drag_payload(QString::default());
+        self.as_mut().set_drag_urls(QStringList::default());
     }
 
     /// The addresses of the named files, if the desktop speaks this destination's protocol.

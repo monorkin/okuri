@@ -17,6 +17,28 @@ impl TransferId {
     }
 }
 
+/// A folder on an open connection.
+///
+/// Which connection is part of where a folder is. Two windows open on the same server are two
+/// sessions, and a path on its own cannot tell you whether the thing dropped onto it came from
+/// the same place or from the other side of the world.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub session: SessionId,
+    pub path: RemotePath,
+}
+
+impl Place {
+    pub fn new(session: SessionId, path: RemotePath) -> Self {
+        Self { session, path }
+    }
+
+    /// This folder as one end of a transfer.
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint::Remote { session: self.session, path: self.path.clone() }
+    }
+}
+
 /// One end of a transfer.
 ///
 /// Both ends being of the same type is what lets a transfer run between two remotes without a
@@ -138,6 +160,11 @@ pub fn counting(
     mut report: impl FnMut(u64) + Send + 'static,
 ) -> ByteStream {
     let size = stream.size();
+
+    // Counted bytes are the same bytes. Anything the source said about them is still true on
+    // the other side of this, and dropping it here would quietly undo it.
+    let serve = stream.serve().clone();
+
     let mut transferred = 0;
     let mut mentioned = None::<Instant>;
 
@@ -158,7 +185,7 @@ pub fn counting(
         chunk
     });
 
-    ByteStream::new(counted, size)
+    ByteStream::new(counted, size).served_as(serve)
 }
 
 #[cfg(test)]
