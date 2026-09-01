@@ -17,16 +17,82 @@ Rectangle {
 
     color: Theme.background
 
+    /// The line under the title, which changes every few seconds.
+    ///
+    /// The same shape as Omarchy's tailscale and network panels: a fixed list, an index walking
+    /// it, and a fade either side of the swap so the words are never caught mid-change.
+    property int phraseIndex: 0
+
+    readonly property var phrases: [
+        "Means “sending” in Japanese",
+        "Carrying files",
+        "Wrapping parcels",
+        "Stacking crates",
+        "Reading addresses",
+        "Sealing boxes",
+        "Weighing packages",
+        "Sorting the post",
+        "Tying string",
+        "Stamping labels",
+        "Loading the cart"
+    ]
+
+    readonly property string phrase: picker.phrases[picker.phraseIndex % picker.phrases.length]
+
+    Timer {
+        interval: 2800
+        running: picker.visible
+        repeat: true
+        onTriggered: swap.restart()
+    }
+
+    SequentialAnimation {
+        id: swap
+
+        PropertyAnimation {
+            target: subtitle
+            property: "opacity"
+            to: 0.0
+            duration: 180
+            easing.type: Easing.OutQuad
+        }
+
+        ScriptAction {
+            script: picker.phraseIndex = (picker.phraseIndex + 1) % picker.phrases.length
+        }
+
+        PropertyAnimation {
+            target: subtitle
+            property: "opacity"
+            to: 1.0
+            duration: 260
+            easing.type: Easing.InQuad
+        }
+    }
+
     Column {
         anchors.centerIn: parent
         width: Math.min(parent.width - 80, 460)
         spacing: 18
 
-        Text {
-            text: "Okuri"
-            font.pixelSize: 28
-            color: Theme.bright
-            anchors.horizontalCenter: parent.horizontalCenter
+        Column {
+            width: parent.width
+            spacing: 6
+
+            Text {
+                text: "Okuri"
+                font.pixelSize: 28
+                color: Theme.bright
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            Text {
+                id: subtitle
+                text: picker.phrase
+                font.pixelSize: 13
+                color: Theme.muted
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
         }
 
         Rectangle {
