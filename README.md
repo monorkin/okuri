@@ -54,7 +54,9 @@ Check every detail about a file and modify it, all from one place.
 
 ### Omarchy themes
 
-Okuri has full theming support for Omarchy.
+Okuri has full theming support for Omarchy. It will adapt it's looks to whatever theme is currently set and updates live whenever the theme changes.
+
+Here are a few screenshots of Okuri in different Omarchy themes:
 
 | Theme | |
 |-|-|
