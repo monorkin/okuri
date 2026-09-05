@@ -161,6 +161,7 @@ mod tests {
             username: "stanko".to_owned(),
             credential: SshCredential::Agent,
             home: String::new(),
+            nodelay: true,
         })
     }
 

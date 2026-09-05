@@ -105,6 +105,7 @@ impl ConnectionList {
                 fields.put("port", sftp.port.to_string());
                 fields.put("username", sftp.username.clone());
                 fields.put("home", sftp.home.clone());
+                fields.put("nodelay", sftp.nodelay.to_string());
 
                 match &sftp.credential {
                     SshCredential::Agent => fields.put("credential", "agent".to_owned()),
@@ -271,6 +272,7 @@ impl Fields {
                 username: self.text("username"),
                 credential: self.credential(),
                 home: String::new(),
+                nodelay: self.text("nodelay") != "false",
             }),
         }
     }
@@ -335,6 +337,25 @@ mod tests {
 
             assert_eq!(fields.destination().kind(), label, "{kind}");
         }
+    }
+
+    /// On unless the editor says otherwise, and remembered when it does.
+    #[test]
+    fn nodelay_is_on_unless_switched_off() {
+        let mut fields = Fields::default();
+        fields.put("kind", "sftp".to_owned());
+
+        let Destination::Sftp(prompt) = fields.destination() else {
+            panic!("an SFTP connection");
+        };
+        assert!(prompt.nodelay);
+
+        fields.put("nodelay", "false".to_owned());
+
+        let Destination::Sftp(bundled) = fields.destination() else {
+            panic!("an SFTP connection");
+        };
+        assert!(!bundled.nodelay);
     }
 
     #[test]

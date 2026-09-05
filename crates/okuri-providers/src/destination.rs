@@ -148,6 +148,16 @@ pub struct Sftp {
     /// Where the session starts. Empty means the account's home directory.
     #[serde(default)]
     pub home: String,
+    /// Whether packets go out as soon as they are written, rather than held back so the
+    /// kernel can bundle small ones. On unless switched off: SFTP is a conversation of small
+    /// requests and acknowledgements, and every one held back for a bundle that never comes
+    /// is a round trip spent waiting.
+    #[serde(default = "default_nodelay")]
+    pub nodelay: bool,
+}
+
+fn default_nodelay() -> bool {
+    true
 }
 
 /// How to prove who we are to an SSH server, in the order most people actually use.
@@ -365,6 +375,7 @@ mod tests {
             username: "stanko".to_owned(),
             credential: SshCredential::Key { path: "~/.ssh/id_ed25519".to_owned() },
             home: "/srv".to_owned(),
+            nodelay: true,
         });
 
         let written = toml::to_string(&destination).unwrap();
@@ -396,6 +407,7 @@ mod tests {
             username: "stanko".to_owned(),
             credential: SshCredential::Agent,
             home: "/srv".to_owned(),
+            nodelay: true,
         });
 
         // The whole path, as the server sees it — the connection's root is not the server's.
@@ -453,6 +465,7 @@ mod tests {
             username: "stanko".to_owned(),
             credential: SshCredential::Agent,
             home: String::new(),
+            nodelay: true,
         });
 
         assert!(!agent.needs_secret());

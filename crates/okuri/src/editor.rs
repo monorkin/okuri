@@ -32,6 +32,7 @@ struct Editor {
     port: adw::EntryRow,
     credential: adw::ComboRow,
     key: adw::EntryRow,
+    nodelay: adw::SwitchRow,
     url: adw::EntryRow,
     username: adw::EntryRow,
     bucket: adw::EntryRow,
@@ -55,6 +56,15 @@ impl Editor {
         credential.set_model(Some(&gtk::StringList::new(&CREDENTIALS.map(|(_, label)| label))));
 
         let key = adw::EntryRow::builder().title("Key file").build();
+
+        // On by default, because SFTP is small requests and acknowledgements, and holding
+        // those back to bundle them is time spent waiting. Here for the odd link where the
+        // packet count is what hurts.
+        let nodelay = adw::SwitchRow::builder()
+            .title("Use TCP nodelay")
+            .subtitle("Faster uploads, but can use more bandwidth")
+            .active(true)
+            .build();
         let url = adw::EntryRow::builder().title("URL").build();
         let username = adw::EntryRow::builder().title("Username").build();
         let bucket = adw::EntryRow::builder().title("Bucket").build();
@@ -67,15 +77,19 @@ impl Editor {
 
         let where_ = adw::PreferencesGroup::new();
 
-        for row in [&host, &port] {
+        // In the order each kind reads best: host, port and who you are before how you prove
+        // it; the address before the account for WebDAV; the switch last.
+        for row in [&host, &port, &url, &username] {
             where_.add(row);
         }
 
         where_.add(&credential);
 
-        for row in [&key, &url, &username, &bucket, &region, &endpoint] {
+        for row in [&key, &bucket, &region, &endpoint] {
             where_.add(row);
         }
+
+        where_.add(&nodelay);
 
         let page = adw::PreferencesPage::new();
         page.add(&about);
@@ -154,6 +168,7 @@ impl Editor {
             port,
             credential,
             key,
+            nodelay,
             url,
             username,
             bucket,
@@ -216,6 +231,7 @@ impl Editor {
         self.endpoint.set_text(&saved.text("endpoint"));
         self.url.set_text(&saved.text("url"));
         self.key.set_text(&saved.text("key"));
+        self.nodelay.set_active(saved.text("nodelay") != "false");
 
         let kind = saved.text("kind");
         let credential = saved.text("credential");
@@ -250,6 +266,7 @@ impl Editor {
         });
         self.credential.set_visible(kind == "sftp");
         self.key.set_visible(kind == "sftp" && self.credential() == "key");
+        self.nodelay.set_visible(kind == "sftp");
         self.url.set_visible(kind == "webdav");
         self.username.set_visible(!storage);
         self.username.set_title(match azure {
@@ -286,6 +303,7 @@ impl Editor {
         fields.put("url", self.url.text().trim().to_owned());
         fields.put("credential", self.credential().to_owned());
         fields.put("key", self.key.text().trim().to_owned());
+        fields.put("nodelay", self.nodelay.is_active().to_string());
 
         fields
     }

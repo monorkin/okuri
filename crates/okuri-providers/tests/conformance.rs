@@ -140,6 +140,7 @@ async fn sftp_says_what_it_tried_to_sign_in_with() {
         username: "okuri".to_owned(),
         credential: SshCredential::Agent,
         home: "/scratch".to_owned(),
+        nodelay: true,
     };
 
     let refused = match SftpProvider::connect(&config, &Secret::None, Arc::new(TrustEverything)).await {
@@ -172,6 +173,7 @@ async fn sftp_reports_where_its_root_sits_on_the_server() {
         credential: SshCredential::Password,
         // Left empty on purpose: the server decides, and that answer is the one that counts.
         home: String::new(),
+        nodelay: true,
     };
 
     let provider = SftpProvider::connect(
@@ -207,6 +209,7 @@ async fn sftp_conforms() {
         username: "okuri".to_owned(),
         credential: SshCredential::Password,
         home: "/scratch".to_owned(),
+        nodelay: true,
     };
 
     let provider = SftpProvider::connect(
@@ -338,6 +341,7 @@ async fn sftp_changes_a_files_mode() {
         username: "okuri".to_owned(),
         credential: SshCredential::Password,
         home: "/scratch".to_owned(),
+        nodelay: true,
     };
 
     let provider = SftpProvider::connect(
@@ -427,6 +431,7 @@ async fn sftp_says_who_owns_a_file_and_where_a_link_points() {
         username: "okuri".to_owned(),
         credential: SshCredential::Password,
         home: "/scratch".to_owned(),
+        nodelay: true,
     };
 
     let provider = SftpProvider::connect(

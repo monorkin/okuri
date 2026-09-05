@@ -52,8 +52,10 @@ impl SftpProvider {
             port,
         };
 
+        let settings = client::Config { nodelay: config.nodelay, ..client::Config::default() };
+
         let mut connection = client::connect(
-            Arc::new(client::Config::default()),
+            Arc::new(settings),
             (host.as_str(), port),
             handler,
         )
