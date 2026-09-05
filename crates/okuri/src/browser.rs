@@ -82,6 +82,7 @@ struct Typed {
 impl Browser {
     pub fn new(weak: Weak<Window>, files: Rc<FileList>) -> Self {
         let selection = gtk::MultiSelection::new(Some(files.store.clone()));
+        files.follow_selection(&selection);
 
         let list = gtk::ListView::new(Some(selection.clone()), None::<gtk::ListItemFactory>);
         list.add_css_class("okuri-files");
@@ -970,16 +971,19 @@ impl ListCell {
         self.bar.set_visible(row.uploading());
         self.bar.set_fraction(row.fraction.unwrap_or_default());
 
-        // Something still on its way is not there yet, and looks it.
-        match row.uploading() {
-            true => self.root.add_css_class("okuri-uploading"),
-            false => self.root.remove_css_class("okuri-uploading"),
+        // Something on its way in or out is not quite there, and looks it.
+        match row.pending() {
+            true => self.root.add_css_class("okuri-pending"),
+            false => self.root.remove_css_class("okuri-pending"),
         }
 
         for (role, label) in &self.columns {
             label.set_text(match *role {
-                "size" if row.uploading() => "Uploading",
-                "size" => &row.size,
+                "size" => match row.leaving {
+                    Some(how) => how.label(),
+                    None if row.uploading() => "Uploading",
+                    None => &row.size,
+                },
                 "kind" => row.kind.label,
                 "modified" => &row.modified,
                 _ => &row.permissions,
@@ -1052,9 +1056,9 @@ impl GridCell {
         self.bar.set_visible(row.uploading());
         self.bar.set_fraction(row.fraction.unwrap_or_default());
 
-        match row.uploading() {
-            true => self.root.add_css_class("okuri-uploading"),
-            false => self.root.remove_css_class("okuri-uploading"),
+        match row.pending() {
+            true => self.root.add_css_class("okuri-pending"),
+            false => self.root.remove_css_class("okuri-pending"),
         }
     }
 }

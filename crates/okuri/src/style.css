@@ -146,8 +146,8 @@ dragicon {
   box-shadow: 0 2px 8px alpha(@okuri_background, 0.5);
 }
 
-/* Something on its way is not here yet, and looks it. */
-.okuri-uploading {
+/* Something on its way in or out is not quite here, and looks it. */
+.okuri-pending {
   opacity: 0.5;
 }
 

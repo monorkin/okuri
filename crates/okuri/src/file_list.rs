@@ -43,6 +43,14 @@ pub struct FileList {
 
     /// Who wants to know when the path, the count or the waiting changes.
     observers: RefCell<Vec<Rc<dyn Fn()>>>,
+
+    /// The views' selection, once there is one, so a row redrawn for its progress can be
+    /// picked again afterwards.
+    selection: RefCell<Option<gtk::MultiSelection>>,
+
+    /// What has been asked to go and not yet confirmed gone. Cleared by the listing that
+    /// follows a deletion, or by the failure that follows one that did not happen.
+    leaving: RefCell<std::collections::HashMap<String, Departure>>,
     subscriptions: RefCell<Vec<Subscription>>,
 }
 
@@ -75,6 +83,7 @@ impl Arriving {
 ///
 /// A row is bound to a widget every time it scrolls into view, so the columns are written when
 /// the listing is built rather than re-derived every time the view passes over them.
+#[derive(Clone)]
 pub struct Row {
     pub entry: Arc<Entry>,
     pub kind: Kind,
@@ -82,6 +91,27 @@ pub struct Row {
     pub modified: String,
     pub permissions: String,
     pub fraction: Option<f64>,
+    /// How this file has been asked to go, when the server has not yet said it has. Drawn as
+    /// already half gone, so the moment between the click and the listing that confirms it
+    /// is not a moment where nothing seems to have happened.
+    pub leaving: Option<Departure>,
+}
+
+/// Why a file is on its way out of the folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Departure {
+    Deleted,
+    Moved,
+}
+
+impl Departure {
+    /// What the size column says while it is happening.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deleted => "Deleting",
+            Self::Moved => "Moving",
+        }
+    }
 }
 
 impl Row {
@@ -101,8 +131,14 @@ impl Row {
                 None => String::new(),
             },
             fraction,
+            leaving: None,
             entry,
         }
+    }
+
+    /// Whether the row is on its way in or out, and so drawn as not quite there.
+    pub fn pending(&self) -> bool {
+        self.uploading() || self.leaving.is_some()
     }
 
     pub fn is_folder(&self) -> bool {
@@ -148,6 +184,8 @@ impl FileList {
             entries: RefCell::new(Vec::new()),
             arriving: RefCell::new(Vec::new()),
             observers: RefCell::new(Vec::new()),
+            selection: RefCell::new(None),
+            leaving: RefCell::new(std::collections::HashMap::new()),
             subscriptions: RefCell::new(Vec::new()),
         });
 
@@ -177,6 +215,19 @@ impl FileList {
     /// Calls `observer` whenever the path, the count, or the waiting changes.
     pub fn on_change(&self, observer: impl Fn() + 'static) {
         self.observers.borrow_mut().push(Rc::new(observer));
+    }
+
+    /// Tells the list which selection the views share, so a redrawn row stays picked.
+    pub fn follow_selection(&self, selection: &gtk::MultiSelection) {
+        *self.selection.borrow_mut() = Some(selection.clone());
+    }
+
+    /// Notes that these files have been asked to go, so they look it until they are.
+    pub fn expect_departure(&self, names: &[String], how: Departure) {
+        self.leaving
+            .borrow_mut()
+            .extend(names.iter().map(|name| (name.clone(), how)));
+        self.rebuild();
     }
 
     pub fn path(&self) -> RemotePath {
@@ -306,6 +357,15 @@ impl FileList {
 
             Event::TransferFinished { transfer, .. } => self.arrived(*transfer),
 
+            // A deletion that did not happen leaves the files where they were, so they stop
+            // looking as though they were going.
+            Event::Failed { concern: okuri_engine::Concern::Session(session), .. }
+                if self.showing(*session) && !self.leaving.borrow().is_empty() =>
+            {
+                self.leaving.borrow_mut().clear();
+                self.rebuild();
+            }
+
             _ => {}
         }
     }
@@ -354,6 +414,7 @@ impl FileList {
 
         *self.path.borrow_mut() = path;
         *self.entries.borrow_mut() = entries.into_iter().map(Arc::new).collect();
+        self.leaving.borrow_mut().clear();
         self.rebuild();
     }
 
@@ -412,10 +473,12 @@ impl FileList {
         }
     }
 
-    /// Changes one row's progress in place and has the view draw that row again.
+    /// Changes one row's progress and has the view draw that row again.
     ///
-    /// The same object goes back into the store, which is what keeps it selected if it was:
-    /// the selection follows the row, not its position.
+    /// A fresh object goes in rather than the same one changed in place: a list view that is
+    /// told a row changed keeps the widget it already has when the object is the one it was
+    /// built for, so the change never reaches the screen. The selection follows the object,
+    /// so a row that was picked is picked again once the swap is done.
     fn redraw(&self, name: &str, fraction: Option<f64>) {
         let position = (0..self.count())
             .find(|row| self.with_row(*row, |row| row.entry.name == name).unwrap_or(false));
@@ -424,11 +487,20 @@ impl FileList {
             return;
         };
 
-        if let Some(object) = self.store.item(position).and_downcast::<glib::BoxedAnyObject>() {
-            object.borrow_mut::<Row>().fraction = fraction;
-        }
+        let Some(mut row) = self.with_row(position, Row::clone) else {
+            return;
+        };
 
-        self.store.items_changed(position, 1, 1);
+        row.fraction = fraction;
+
+        let selection = self.selection.borrow().clone();
+        let picked = selection.as_ref().is_some_and(|selection| selection.is_selected(position));
+
+        self.store.splice(position, 1, &[glib::BoxedAnyObject::new(row)]);
+
+        if picked && let Some(selection) = selection {
+            selection.select_item(position, false);
+        }
     }
 
     /// Rebuilds the rows on screen from what the server said and what is on its way.
@@ -438,7 +510,7 @@ impl FileList {
     fn rebuild(&self) {
         let settings = crate::view::current();
 
-        let rows = merge(
+        let mut rows = merge(
             &self.entries.borrow(),
             &self.arriving.borrow(),
             &self.path.borrow(),
@@ -448,6 +520,12 @@ impl FileList {
                 descending: settings.sort_descending,
             },
         );
+
+        let leaving = self.leaving.borrow();
+
+        for row in &mut rows {
+            row.leaving = leaving.get(&row.entry.name).copied();
+        }
 
         let objects = rows.into_iter().map(glib::BoxedAnyObject::new).collect::<Vec<_>>();
 

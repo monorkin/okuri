@@ -24,7 +24,7 @@ use okuri_engine::{Answer, Attempt, Concern, Event, SessionId};
 use crate::browser::Browser;
 use crate::details::Details;
 use crate::dialogs::{self, Reply};
-use crate::file_list::FileList;
+use crate::file_list::{Departure, FileList};
 use crate::picker::Picker;
 use crate::relay::Subscription;
 use crate::screen::{Carried, Screen};
@@ -510,6 +510,9 @@ impl Window {
     }
 
     pub fn remove(&self, names: Vec<String>) {
+        // Shown as going before the server is asked: deleting takes a round trip per file, and
+        // a list that sits unchanged until the last one reads as a click that did nothing.
+        self.files.expect_departure(&names, Departure::Deleted);
         self.command(move |session| Command::Delete { session, names });
     }
 
@@ -577,6 +580,15 @@ impl Window {
             self.complain(format!("{folder} is not a folder this connection has"));
             return;
         };
+
+        // Files leaving the folder on screen are shown leaving it: a move on one connection
+        // is a rename per file and a listing at the end, and until that listing lands the
+        // list would otherwise sit as though the drop had missed.
+        let ours = carried.session == session && carried.folder == self.screen.borrow().folder;
+
+        if ours && carried.folder != path {
+            self.files.expect_departure(&carried.names, Departure::Moved);
+        }
 
         let from = Place::new(carried.session, carried.folder);
         let into = Place::new(session, path);
@@ -916,9 +928,11 @@ impl Window {
         self.transfers
             .set_sensitive(self.screen.borrow().connected || queue.count() > 0);
 
+        // Coloured rather than filled: a filled button in this toolbar draws as nothing at
+        // all, and a button that vanishes while a transfer runs is the one you want then.
         match active > 0 {
-            true => self.transfers.add_css_class("suggested-action"),
-            false => self.transfers.remove_css_class("suggested-action"),
+            true => self.transfers.add_css_class("accent"),
+            false => self.transfers.remove_css_class("accent"),
         }
     }
 

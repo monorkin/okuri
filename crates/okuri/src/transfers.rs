@@ -128,16 +128,23 @@ impl Transfers {
         self.announce();
     }
 
+    /// Changes one row and has the list draw it again.
+    ///
+    /// A fresh object goes in rather than the same one changed in place: a list view that is
+    /// told a row changed keeps the widget it already has when the object is the one it was
+    /// built for, so the change never reaches the screen. Nothing here is selectable, so
+    /// nothing is lost by the swap.
     fn touch(&self, id: TransferId, change: impl FnOnce(&mut Transfer)) {
         let Some(row) = self.rows.borrow().get(&id).copied() else {
             return;
         };
 
-        if let Some(object) = self.store.item(row).and_downcast::<glib::BoxedAnyObject>() {
-            change(&mut object.borrow_mut::<Transfer>());
-        }
+        let Some(mut transfer) = self.with_row(row, Transfer::clone) else {
+            return;
+        };
 
-        self.store.items_changed(row, 1, 1);
+        change(&mut transfer);
+        self.store.splice(row, 1, &[glib::BoxedAnyObject::new(transfer)]);
     }
 
     fn reindex(&self) {
