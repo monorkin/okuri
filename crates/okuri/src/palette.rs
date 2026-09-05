@@ -117,6 +117,26 @@ impl Palette {
         }))
     }
 
+    /// Every colour, under the name the stylesheet knows it by.
+    pub fn roles(&self) -> [(&'static str, Color); 14] {
+        [
+            ("background", self.background),
+            ("surface", self.surface),
+            ("elevated", self.elevated),
+            ("foreground", self.foreground),
+            ("bright", self.bright),
+            ("muted", self.muted),
+            ("accent", self.accent),
+            ("accent_text", self.accent_text),
+            ("selection", self.selection),
+            ("selection_text", self.selection_text),
+            ("border", self.border),
+            ("error", self.error),
+            ("warning", self.warning),
+            ("success", self.success),
+        ]
+    }
+
     pub fn dark() -> Self {
         Self::from_roles(RoleColors {
             dark: true,
@@ -227,7 +247,7 @@ fn dark_from_gtk_settings(settings: &str) -> Option<bool> {
 /// A themed accent can be anything from navy to lemon, so the label written on top of it cannot
 /// be a fixed colour. Neither candidate is the default: the one with more contrast wins, and
 /// `preferred` only settles a tie.
-fn readable_on(background: Color, preferred: Color, alternative: Color) -> Color {
+pub fn readable_on(background: Color, preferred: Color, alternative: Color) -> Color {
     let contrast = |candidate: Color| (candidate.luminance() - background.luminance()).abs();
 
     if contrast(preferred) >= contrast(alternative) {

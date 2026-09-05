@@ -1,8 +1,8 @@
 # Okuri
 
-Dead-simple file transfer for Omarchy & Linux.
+Dead-simple file transfer for Omarchy / Linux.
 
-![Okuri's icon](./assets/icon.png)
+<img src="./assets/icon.png" alt="Okuri's icon" width="256">
 
 Supports:
 - SFTP
@@ -12,6 +12,7 @@ Supports:
 - Backblaze B2
 - Azure Blob Storage
 - WebDAV
+
 
 ## Install
 
@@ -73,8 +74,10 @@ Here are a few screenshots of Okuri in different Omarchy themes:
 
 ## For nerds
 
-Okuri is a native application built with Qt (with QML) and Rust.
-Qt 6 is dynamically linked, so you have to have it installed on your machine for Okuri to run.
+Okuri is a native application built with GTK 4, libadwaita and Rust.
+GTK 4 and libadwaita are dynamically linked, so both have to be installed on your machine for Okuri to run.
+
+On Omarchy the window is painted from the current theme's `colors.toml` and follows a theme switch live. Anywhere else it falls back to a built-in dark or light palette, whichever the desktop asks for.
 
 To run it locally:
 ```bash

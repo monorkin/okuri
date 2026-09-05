@@ -1,165 +1,49 @@
-use std::pin::Pin;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use okuri_core::{Access, Column, Entry, RemotePath, Sort, Who};
+use gtk::prelude::*;
+use gtk::{gio, glib};
+use okuri_core::{Column, Entry, Permissions, RemotePath, Sort};
 use okuri_engine::transfer::Endpoint;
 use okuri_engine::{Event, SessionId, TransferId};
-use cxx_qt::{CxxQtType, Threading};
-use cxx_qt_lib::{
-    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QMap, QMapPair_QString_QVariant,
-    QModelIndex, QString, QVariant,
-};
 
 use crate::format;
+use crate::kinds::Kind;
+use crate::relay::Subscription;
 
 /// The rows of the file list.
 ///
 /// Holds the listing for whichever folder is open and nothing else: what happens when you
-/// double-click is the application's business, not the model's.
-#[cxx_qt::bridge]
-pub mod qobject {
-    unsafe extern "C++" {
-        include!("cxx-qt-lib/qstring.h");
-        type QString = cxx_qt_lib::QString;
-        include!("cxx-qt-lib/qvariant.h");
-        type QVariant = cxx_qt_lib::QVariant;
-        include!("cxx-qt-lib/qmodelindex.h");
-        type QModelIndex = cxx_qt_lib::QModelIndex;
-        include!("cxx-qt-lib/qhash.h");
-        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
-        include!("cxx-qt-lib/qlist.h");
-        type QList_i32 = cxx_qt_lib::QList<i32>;
-    }
-
-    unsafe extern "C++" {
-        include!("cxx-qt-lib/qmap.h");
-        type QMap_QString_QVariant = cxx_qt_lib::QMap<cxx_qt_lib::QMapPair_QString_QVariant>;
-    }
-
-    unsafe extern "C++Qt" {
-        include!(<QtCore/QAbstractListModel>);
-
-        type QAbstractListModel = crate::qt::qobject::QAbstractListModel;
-    }
-
-    #[auto_cxx_name]
-    extern "RustQt" {
-        #[qobject]
-        #[qml_element]
-        #[base = QAbstractListModel]
-        #[qproperty(QString, path)]
-        #[qproperty(bool, working)]
-        #[qproperty(i32, count)]
-        type FileList = super::FileListRust;
-
-        #[qinvokable]
-        #[cxx_override]
-        fn data(self: &FileList, index: &QModelIndex, role: i32) -> QVariant;
-
-        #[qinvokable]
-        #[cxx_override]
-        #[cxx_name = "rowCount"]
-        fn row_count(self: &FileList, parent: &QModelIndex) -> i32;
-
-        #[qinvokable]
-        #[cxx_override]
-        #[cxx_name = "roleNames"]
-        fn role_names(self: &FileList) -> QHash_i32_QByteArray;
-
-        /// Shows the connection its window has open, and empties itself when that changes.
-        #[qinvokable]
-        fn follow(self: Pin<&mut FileList>, session: i64);
-
-        /// The row a type-ahead search should land on, or -1 when nothing matches.
-        #[qinvokable]
-        fn find(self: &FileList, prefix: QString, after: i32) -> i32;
-
-        #[qinvokable]
-        fn name_at(self: &FileList, row: i32) -> QString;
-
-        #[qinvokable]
-        fn is_folder_at(self: &FileList, row: i32) -> bool;
-
-        /// The icon of a row, which is what a drag of it should look like.
-        #[qinvokable]
-        fn icon_at(self: &FileList, row: i32) -> QString;
-
-        /// Everything known about one row, for showing it on its own.
-        ///
-        /// Handed over as one object rather than a getter per column, because the columns are
-        /// already worked out when the listing is built and this is the same set of them.
-        #[qinvokable]
-        fn details(self: &FileList, row: i32) -> QMap_QString_QVariant;
-    }
-
-    unsafe extern "RustQt" {
-        #[inherit]
-        #[cxx_name = "beginResetModel"]
-        unsafe fn begin_reset_model(self: Pin<&mut FileList>);
-
-        #[inherit]
-        #[cxx_name = "endResetModel"]
-        unsafe fn end_reset_model(self: Pin<&mut FileList>);
-
-        #[inherit]
-        #[cxx_name = "dataChanged"]
-        unsafe fn data_changed(
-            self: Pin<&mut FileList>,
-            top_left: &QModelIndex,
-            bottom_right: &QModelIndex,
-            roles: &QList_i32,
-        );
-
-        #[inherit]
-        fn index(self: &FileList, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex;
-    }
-
-    impl cxx_qt::Threading for FileList {}
-
-    impl cxx_qt::Initialize for FileList {}
-}
-
-/// `Qt::UserRole`, where roles a model defines for itself are allowed to start.
-const USER_ROLE: i32 = 0x0100;
-
-const NAME: i32 = USER_ROLE;
-const SIZE: i32 = USER_ROLE + 1;
-const MODIFIED: i32 = USER_ROLE + 2;
-const IS_FOLDER: i32 = USER_ROLE + 3;
-const PERMISSIONS: i32 = USER_ROLE + 4;
-const KIND: i32 = USER_ROLE + 5;
-const ICON: i32 = USER_ROLE + 6;
-const UPLOADING: i32 = USER_ROLE + 7;
-const FRACTION: i32 = USER_ROLE + 8;
-
-pub struct FileListRust {
-    path: QString,
-    working: bool,
-    count: i32,
+/// double-click is the window's business, not the model's. The rows themselves live in a
+/// `ListStore` the views draw from, each one a [`Row`] with everything it shows worked out.
+pub struct FileList {
+    pub store: gio::ListStore,
+    path: RefCell<RemotePath>,
+    working: Cell<bool>,
 
     /// Which connection this list is showing, once one is open.
     ///
     /// Every event says which session it came from, and a list that ignored that would redraw
     /// itself from any connection's news — which is what a second list beside this one would
     /// make happen on its first listing.
-    session: Option<SessionId>,
+    session: Cell<Option<SessionId>>,
 
     /// What the server last said is here.
     ///
     /// Shared with the rows rather than copied into them: sorting is done on the handles, and a
     /// folder of fifty thousand files would otherwise hold every name twice over — once here
     /// and once in the row drawing it.
-    entries: Vec<Arc<Entry>>,
+    entries: RefCell<Vec<Arc<Entry>>>,
 
     /// What is on its way here. Shown alongside the real entries so that dropping a file puts
     /// it in the list at once, with a bar that fills — rather than nothing happening until the
     /// upload finishes and the folder is listed again.
-    arriving: Vec<Arriving>,
+    arriving: RefCell<Vec<Arriving>>,
 
-    /// The two merged, filtered, and sorted: exactly the rows on screen.
-    rows: Vec<Row>,
-
-    icons: crate::icons::Icons,
+    /// Who wants to know when the path, the count or the waiting changes.
+    observers: RefCell<Vec<Rc<dyn Fn()>>>,
+    subscriptions: RefCell<Vec<Subscription>>,
 }
 
 struct Arriving {
@@ -189,27 +73,21 @@ impl Arriving {
 
 /// One line of the list, with everything it draws worked out already.
 ///
-/// `data` is called once per column per repaint, so the columns are written when the listing
-/// is built rather than re-derived every time the view scrolls past them.
-struct Row {
-    entry: Arc<Entry>,
-    icon: String,
-    size: String,
-    modified: String,
-    permissions: String,
-    kind: &'static str,
-    fraction: Option<f64>,
+/// A row is bound to a widget every time it scrolls into view, so the columns are written when
+/// the listing is built rather than re-derived every time the view passes over them.
+pub struct Row {
+    pub entry: Arc<Entry>,
+    pub kind: Kind,
+    pub size: String,
+    pub modified: String,
+    pub permissions: String,
+    pub fraction: Option<f64>,
 }
 
 impl Row {
-    fn new(
-        icon: String,
-        fraction: Option<f64>,
-        now: time::OffsetDateTime,
-        entry: Arc<Entry>,
-    ) -> Self {
+    fn new(fraction: Option<f64>, now: time::OffsetDateTime, entry: Arc<Entry>) -> Self {
         Self {
-            icon,
+            kind: crate::kinds::of(&entry.name, entry.kind.is_folder()),
             size: match entry.kind.is_folder() {
                 true => String::new(),
                 false => format::size(entry.size),
@@ -222,55 +100,176 @@ impl Row {
                 Some(permissions) => permissions.to_symbolic(),
                 None => String::new(),
             },
-            kind: crate::kinds::of(&entry.name, entry.kind.is_folder()).label,
             fraction,
             entry,
         }
     }
-}
 
-impl Default for FileListRust {
-    fn default() -> Self {
-        Self {
-            path: QString::from("/"),
-            working: false,
-            count: 0,
-            session: None,
-            entries: Vec::new(),
-            arriving: Vec::new(),
-            rows: Vec::new(),
-            icons: crate::icons::Icons::new(),
-        }
+    pub fn is_folder(&self) -> bool {
+        self.entry.kind.is_folder()
+    }
+
+    pub fn uploading(&self) -> bool {
+        self.fraction.is_some()
+    }
+
+    pub fn icon(&self) -> gio::ThemedIcon {
+        crate::icons::for_kind(self.kind)
     }
 }
 
-impl cxx_qt::Initialize for qobject::FileList {
-    /// Subscribes once the object exists, and queues every update back onto the interface
-    /// thread. Nothing here ever touches the engine's threads directly.
-    fn initialize(self: Pin<&mut Self>) {
-        let thread = self.qt_thread();
+/// Everything known about one row, for showing it on its own.
+#[derive(Clone, Debug, Default)]
+pub struct Facts {
+    pub name: String,
+    pub kind: &'static str,
+    pub size: String,
+    pub modified: String,
+    pub permissions: String,
+    pub is_folder: bool,
+    /// The mode, for spelling out as nine answers rather than nine characters.
+    pub mode: Option<Permissions>,
+}
+
+impl Facts {
+    pub fn icon(&self) -> gio::ThemedIcon {
+        crate::icons::for_kind(crate::kinds::of(&self.name, self.is_folder))
+    }
+}
+
+impl FileList {
+    /// Subscribes once the list exists, and hears every update on the interface thread.
+    pub fn new() -> Rc<Self> {
+        let list = Rc::new(Self {
+            store: gio::ListStore::new::<glib::BoxedAnyObject>(),
+            path: RefCell::new(RemotePath::root()),
+            working: Cell::new(false),
+            session: Cell::new(None),
+            entries: RefCell::new(Vec::new()),
+            arriving: RefCell::new(Vec::new()),
+            observers: RefCell::new(Vec::new()),
+            subscriptions: RefCell::new(Vec::new()),
+        });
 
         // Every event carries the session it came from, and a list beside this one has to
         // ignore the other's news rather than redraw itself with it — so the filtering happens
         // here, where the answer to "which connection am I" can actually be read.
-        crate::bus::listen(move |event| match event.as_ref() {
+        let weak = Rc::downgrade(&list);
+        let news = crate::relay::on_event(move |event| {
+            if let Some(list) = weak.upgrade() {
+                list.receive(event);
+            }
+        });
+
+        // Sorting and hidden files are display settings, held once and read from here.
+        let weak = Rc::downgrade(&list);
+        let redraw = crate::relay::on_view_change(move || {
+            if let Some(list) = weak.upgrade() {
+                list.rebuild();
+            }
+        });
+
+        list.subscriptions.borrow_mut().extend([news, redraw]);
+
+        list
+    }
+
+    /// Calls `observer` whenever the path, the count, or the waiting changes.
+    pub fn on_change(&self, observer: impl Fn() + 'static) {
+        self.observers.borrow_mut().push(Rc::new(observer));
+    }
+
+    pub fn path(&self) -> RemotePath {
+        self.path.borrow().clone()
+    }
+
+    pub fn working(&self) -> bool {
+        self.working.get()
+    }
+
+    pub fn count(&self) -> u32 {
+        self.store.n_items()
+    }
+
+    /// Starts showing a connection, and stops showing whatever was there before.
+    ///
+    /// Told which one rather than working it out from whichever connection opened last. Every
+    /// window hears every connection open, so a list that adopted the newest would swap to the
+    /// server the window next door had just reached.
+    pub fn follow(&self, session: Option<SessionId>) {
+        if self.session.get() == session {
+            return;
+        }
+
+        self.session.set(session);
+        self.empty();
+    }
+
+    /// The row a type-ahead search should land on, or nothing when nothing matches.
+    pub fn find(&self, prefix: &str, after: Option<u32>) -> Option<u32> {
+        let prefix = prefix.to_lowercase();
+
+        if prefix.is_empty() {
+            return None;
+        }
+
+        let names = (0..self.count())
+            .map(|row| self.with_row(row, |row| row.entry.name.to_lowercase()).unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        // Wraps around, so holding down a letter cycles through everything starting with it.
+        let start = after.map(|row| row as usize + 1).unwrap_or(0).min(names.len());
+
+        (start..names.len())
+            .chain(0..start)
+            .find(|row| names[*row].starts_with(&prefix))
+            .map(|row| row as u32)
+    }
+
+    pub fn name_at(&self, row: u32) -> Option<String> {
+        self.with_row(row, |row| row.entry.name.clone())
+    }
+
+    pub fn is_folder_at(&self, row: u32) -> bool {
+        self.with_row(row, Row::is_folder).unwrap_or(false)
+    }
+
+    /// The full path of a row, which is what a drop onto it means.
+    pub fn path_of(&self, row: u32) -> Option<RemotePath> {
+        let name = self.name_at(row)?;
+
+        self.path.borrow().join(&name).ok()
+    }
+
+    pub fn facts_at(&self, row: u32) -> Option<Facts> {
+        self.with_row(row, |row| Facts {
+            name: row.entry.name.clone(),
+            kind: row.kind.label,
+            size: row.size.clone(),
+            modified: row.modified.clone(),
+            permissions: row.permissions.clone(),
+            is_folder: row.is_folder(),
+            mode: row.entry.permissions,
+        })
+    }
+
+    /// Reads one row, if there is one.
+    pub fn with_row<T>(&self, row: u32, read: impl FnOnce(&Row) -> T) -> Option<T> {
+        let object = self.store.item(row)?.downcast::<glib::BoxedAnyObject>().ok()?;
+        let row = object.borrow::<Row>();
+
+        Some(read(&row))
+    }
+
+    fn receive(&self, event: &Event) {
+        match event {
             Event::Listing { session, path, entries } => {
-                let (session, path, entries) = (*session, path.clone(), entries.clone());
-
-                crate::qt::queue(&thread, move |model| model.replace(session, path, entries));
+                self.replace(*session, path.clone(), entries.clone());
             }
 
-            Event::Working { session, working } => {
-                let (session, working) = (*session, *working);
+            Event::Working { session, working } => self.set_busy(*session, *working),
 
-                crate::qt::queue(&thread, move |model| model.set_busy(session, working));
-            }
-
-            Event::Disconnected { session } => {
-                let session = *session;
-
-                crate::qt::queue(&thread, move |model| model.close(session));
-            }
+            Event::Disconnected { session } => self.close(*session),
 
             // A file that has been dropped belongs on screen immediately, filling as it goes.
             Event::TransferAdded(transfer) => {
@@ -286,226 +285,34 @@ impl cxx_qt::Initialize for qobject::FileList {
                     return;
                 };
 
-                let arriving = Arriving {
-                    transfer: transfer.id,
-                    folder,
-                    name: name.to_owned(),
-                    transferred: 0,
-                    total: transfer.total,
-                    landed: false,
-                };
-
-                crate::qt::queue(&thread, move |model| model.expect(session, arriving));
+                self.expect(
+                    session,
+                    Arriving {
+                        transfer: transfer.id,
+                        folder,
+                        name: name.to_owned(),
+                        transferred: 0,
+                        total: transfer.total,
+                        landed: false,
+                    },
+                );
             }
 
             // Progress and completion carry no session, and need none: they can only ever name
             // a transfer this list already agreed to show.
             Event::TransferProgress { transfer, transferred } => {
-                let (id, transferred) = (*transfer, *transferred);
-
-                crate::qt::queue(&thread, move |model| model.advance(id, transferred));
+                self.advance(*transfer, *transferred);
             }
 
-            Event::TransferFinished { transfer, .. } => {
-                let id = *transfer;
-
-                crate::qt::queue(&thread, move |model| model.arrived(id));
-            }
+            Event::TransferFinished { transfer, .. } => self.arrived(*transfer),
 
             _ => {}
-        })
-        .forever();
-
-        // Icons come from the desktop's theme, so switching themes has to change them here as
-        // well. Without this the window keeps drawing the icons of a theme that is gone.
-        let thread = self.qt_thread();
-
-        crate::desktop::on_theme_change(move || {
-            crate::qt::queue(&thread, |model| model.reload_icons());
-        });
-
-        // Sorting and hidden files are display settings, held once and read from here.
-        let thread = self.qt_thread();
-
-        crate::view::on_change(move || {
-            crate::qt::queue(&thread, |model| model.rebuild());
-        });
-    }
-}
-
-impl qobject::FileList {
-    pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
-        let Some(row) = self.rust().rows.get(index.row() as usize) else {
-            return QVariant::default();
-        };
-
-        let text = |value: String| QVariant::from(&QString::from(&value));
-
-        match role {
-            NAME => text(row.entry.name.clone()),
-            SIZE => text(row.size.clone()),
-            MODIFIED => text(row.modified.clone()),
-            IS_FOLDER => QVariant::from(&row.entry.kind.is_folder()),
-            PERMISSIONS => text(row.permissions.clone()),
-            KIND => text(row.kind.to_owned()),
-            ICON => text(row.icon.clone()),
-            UPLOADING => QVariant::from(&row.fraction.is_some()),
-            FRACTION => QVariant::from(&row.fraction.unwrap_or_default()),
-            _ => QVariant::default(),
         }
-    }
-
-    pub fn row_count(&self, _parent: &QModelIndex) -> i32 {
-        self.rust().rows.len() as i32
-    }
-
-    pub fn role_names(&self) -> QHash<QHashPair_i32_QByteArray> {
-        let mut names = QHash::<QHashPair_i32_QByteArray>::default();
-
-        names.insert(NAME, QByteArray::from("name"));
-        names.insert(SIZE, QByteArray::from("size"));
-        names.insert(MODIFIED, QByteArray::from("modified"));
-        names.insert(IS_FOLDER, QByteArray::from("isFolder"));
-        names.insert(PERMISSIONS, QByteArray::from("permissions"));
-        names.insert(KIND, QByteArray::from("kind"));
-        names.insert(ICON, QByteArray::from("icon"));
-        names.insert(UPLOADING, QByteArray::from("uploading"));
-        names.insert(FRACTION, QByteArray::from("fraction"));
-
-        names
-    }
-
-    pub fn find(&self, prefix: QString, after: i32) -> i32 {
-        let prefix = prefix.to_string().to_lowercase();
-
-        if prefix.is_empty() {
-            return -1;
-        }
-
-        let names = self
-            .rust()
-            .rows
-            .iter()
-            .map(|row| row.entry.name.to_lowercase())
-            .collect::<Vec<_>>();
-        // `-1` means "start from the top", which is what the first keystroke of a search sends.
-        let start = usize::try_from(after + 1).unwrap_or(0);
-
-        // Wraps around, so holding down a letter cycles through everything starting with it.
-        (start..names.len())
-            .chain(0..start.min(names.len()))
-            .find(|row| names[*row].starts_with(&prefix))
-            .map(|row| row as i32)
-            .unwrap_or(-1)
-    }
-
-    pub fn name_at(&self, row: i32) -> QString {
-        QString::from(
-            &self.at(row).map(|row| row.entry.name.clone()).unwrap_or_default(),
-        )
-    }
-
-    pub fn icon_at(&self, row: i32) -> QString {
-        QString::from(&self.at(row).map(|row| row.icon.clone()).unwrap_or_default())
-    }
-
-    pub fn is_folder_at(&self, row: i32) -> bool {
-        self.at(row).is_some_and(|row| row.entry.kind.is_folder())
-    }
-
-    pub fn details(&self, row: i32) -> QMap<QMapPair_QString_QVariant> {
-        let mut details = QMap::<QMapPair_QString_QVariant>::default();
-
-        let Some(row) = self.at(row) else {
-            return details;
-        };
-
-        let mut put = |key: &str, value: &str| {
-            details.insert(QString::from(key), QVariant::from(&QString::from(value)));
-        };
-
-        put("name", &row.entry.name);
-        put("kind", row.kind);
-        put("size", &row.size);
-        put("modified", &row.modified);
-        put("permissions", &row.permissions);
-        put("icon", &row.icon);
-
-        details.insert(
-            QString::from("isFolder"),
-            QVariant::from(&row.entry.kind.is_folder()),
-        );
-
-        // The exact number as well as the readable one: "244 KB" is what you want to read and
-        // the wrong thing to check a download against.
-        details.insert(
-            QString::from("bytes"),
-            QVariant::from(&(row.entry.size as i64)),
-        );
-
-        // The mode as nine answers rather than nine characters. `rw-rw-r--` is a shorthand you
-        // have to already know how to read, and this panel is the one place with room to spell
-        // it out.
-        if let Some(permissions) = row.entry.permissions {
-            for (who, name) in [
-                (Who::Owner, "owner"),
-                (Who::Group, "group"),
-                (Who::Everyone, "everyone"),
-            ] {
-                for (access, verb) in [
-                    (Access::Read, "read"),
-                    (Access::Write, "write"),
-                    (Access::Execute, "execute"),
-                ] {
-                    details.insert(
-                        QString::from(&format!("{name}-{verb}")),
-                        QVariant::from(&permissions.allows(who, access)),
-                    );
-                }
-            }
-        }
-
-        details
-    }
-
-    /// The row at `row`, if there is one.
-    ///
-    /// QML says "nothing is selected" with `-1`, and clamping that to zero would quietly answer
-    /// every question about the selection with the first file in the list.
-    fn at(&self, row: i32) -> Option<&Row> {
-        self.rust().rows.get(usize::try_from(row).ok()?)
-    }
-
-    /// Re-reads the desktop's icon theme and redraws with it.
-    fn reload_icons(mut self: Pin<&mut Self>) {
-        self.as_mut().rust_mut().icons = crate::icons::Icons::new();
-        self.rebuild();
-    }
-
-    /// Starts showing a connection, and stops showing whatever was there before.
-    ///
-    /// Told which one rather than working it out from whichever connection opened last. Every
-    /// window hears every connection open, so a list that adopted the newest would swap to the
-    /// server the window next door had just reached.
-    ///
-    /// Zero is no connection at all, which is what disconnecting leaves behind.
-    pub fn follow(mut self: Pin<&mut Self>, session: i64) {
-        let now = match u64::try_from(session) {
-            Ok(0) | Err(_) => None,
-            Ok(id) => Some(SessionId(id)),
-        };
-
-        if self.rust().session == now {
-            return;
-        }
-
-        self.as_mut().rust_mut().session = now;
-        self.empty();
     }
 
     /// Whether news from `session` is news about what this list is showing.
     fn showing(&self, session: SessionId) -> bool {
-        self.rust().session == Some(session)
+        self.session.get() == Some(session)
     }
 
     /// Puts the list back to an empty root.
@@ -513,69 +320,65 @@ impl qobject::FileList {
     /// What is on screen belongs to whichever connection was open before, and leaving it there
     /// means a moment where a new server appears to hold another one's files — and a moment is
     /// long enough to click something.
-    fn empty(mut self: Pin<&mut Self>) {
-        self.as_mut().rust_mut().arriving.clear();
-        self.as_mut().rust_mut().entries.clear();
-        self.as_mut().set_path(QString::from("/"));
+    fn empty(&self) {
+        self.arriving.borrow_mut().clear();
+        self.entries.borrow_mut().clear();
+        *self.path.borrow_mut() = RemotePath::root();
         self.rebuild();
     }
 
-    fn close(mut self: Pin<&mut Self>, session: SessionId) {
+    fn close(&self, session: SessionId) {
         if self.showing(session) {
-            self.as_mut().rust_mut().session = None;
+            self.session.set(None);
             self.empty();
         }
     }
 
-    fn set_busy(mut self: Pin<&mut Self>, session: SessionId, working: bool) {
+    fn set_busy(&self, session: SessionId, working: bool) {
         if self.showing(session) {
-            self.as_mut().set_working(working);
+            self.working.set(working);
+            self.announce();
         }
     }
 
-    fn replace(mut self: Pin<&mut Self>, session: SessionId, path: RemotePath, entries: Vec<Entry>) {
+    fn replace(&self, session: SessionId, path: RemotePath, entries: Vec<Entry>) {
         if !self.showing(session) {
             return;
         }
 
         // A fresh listing of a folder is the truth about it, so anything that was standing in
         // for a file there has done its job.
-        self.as_mut()
-            .rust_mut()
-            .arriving
+        self.arriving
+            .borrow_mut()
             .retain(|arriving| !(arriving.landed && arriving.folder == path));
 
-        self.as_mut().set_path(QString::from(&path.to_string()));
-        self.as_mut().rust_mut().entries = entries.into_iter().map(Arc::new).collect();
+        *self.path.borrow_mut() = path;
+        *self.entries.borrow_mut() = entries.into_iter().map(Arc::new).collect();
         self.rebuild();
     }
 
     /// Notes a file that is on its way here, so it shows up the moment it is dropped.
-    fn expect(mut self: Pin<&mut Self>, session: SessionId, arriving: Arriving) {
+    fn expect(&self, session: SessionId, arriving: Arriving) {
         if !self.showing(session) {
             return;
         }
 
-        self.as_mut().rust_mut().arriving.push(arriving);
+        self.arriving.borrow_mut().push(arriving);
         self.rebuild();
     }
 
     /// Moves one row's progress along.
     ///
-    /// Deliberately not a rebuild: progress arrives many times a second, and resetting the
-    /// model on each one would tear down every row on screen, taking the selection and the
-    /// scroll position with it. Only the row that moved is touched.
-    fn advance(mut self: Pin<&mut Self>, transfer: TransferId, transferred: u64) {
+    /// Deliberately not a rebuild: progress arrives many times a second, and replacing every
+    /// row on each one would take the selection and the scroll position with it. Only the row
+    /// that moved is touched.
+    fn advance(&self, transfer: TransferId, transferred: u64) {
         let mut moved = None;
 
-        for arriving in self.as_mut().rust_mut().arriving.iter_mut() {
+        for arriving in self.arriving.borrow_mut().iter_mut() {
             if arriving.transfer == transfer {
                 arriving.transferred = transferred;
-                    moved = Some((
-                    arriving.folder.clone(),
-                    arriving.name.clone(),
-                    arriving.fraction(),
-                ));
+                moved = Some((arriving.folder.clone(), arriving.name.clone(), arriving.fraction()));
             }
         }
 
@@ -583,73 +386,83 @@ impl qobject::FileList {
             return;
         };
 
-        let here = RemotePath::parse(&self.path().to_string()).unwrap_or_default();
-
-        if folder != here {
-            return;
+        if folder == *self.path.borrow() {
+            self.redraw(&name, fraction);
         }
-
-        let row = self
-            .rust()
-            .rows
-            .iter()
-            .position(|row| row.entry.name == name);
-
-        let Some(row) = row else {
-            return;
-        };
-
-        self.as_mut().rust_mut().rows[row].fraction = fraction;
-
-        let at = self.index(row as i32, 0, &QModelIndex::default());
-        unsafe { self.as_mut().data_changed(&at, &at, &QList::<i32>::default()) };
     }
 
     /// Marks a file as landed, which drops its progress bar but leaves the row in place. The
     /// listing that follows carries the real entry, with the size and time the server gave it.
-    fn arrived(mut self: Pin<&mut Self>, transfer: TransferId) {
-        let mut landed = false;
+    fn arrived(&self, transfer: TransferId) {
+        let mut landed = None;
 
-        for arriving in self.as_mut().rust_mut().arriving.iter_mut() {
+        for arriving in self.arriving.borrow_mut().iter_mut() {
             if arriving.transfer == transfer {
                 arriving.landed = true;
-                landed = true;
+                landed = Some((arriving.folder.clone(), arriving.name.clone()));
             }
         }
 
-        if landed {
-            self.rebuild();
+        let Some((folder, name)) = landed else {
+            return;
+        };
+
+        if folder == *self.path.borrow() {
+            self.redraw(&name, None);
         }
+    }
+
+    /// Changes one row's progress in place and has the view draw that row again.
+    ///
+    /// The same object goes back into the store, which is what keeps it selected if it was:
+    /// the selection follows the row, not its position.
+    fn redraw(&self, name: &str, fraction: Option<f64>) {
+        let position = (0..self.count())
+            .find(|row| self.with_row(*row, |row| row.entry.name == name).unwrap_or(false));
+
+        let Some(position) = position else {
+            return;
+        };
+
+        if let Some(object) = self.store.item(position).and_downcast::<glib::BoxedAnyObject>() {
+            object.borrow_mut::<Row>().fraction = fraction;
+        }
+
+        self.store.items_changed(position, 1, 1);
     }
 
     /// Rebuilds the rows on screen from what the server said and what is on its way.
     ///
-    /// A listing arrives whole rather than row by row, so a reset says exactly what happened
-    /// and avoids pretending otherwise.
-    fn rebuild(mut self: Pin<&mut Self>) {
-        let here = RemotePath::parse(&self.path().to_string()).unwrap_or_default();
-
+    /// A listing arrives whole rather than row by row, so the store is replaced whole and
+    /// avoids pretending otherwise.
+    fn rebuild(&self) {
         let settings = crate::view::current();
 
         let rows = merge(
-            &self.rust().entries,
-            &self.rust().arriving,
-            &here,
+            &self.entries.borrow(),
+            &self.arriving.borrow(),
+            &self.path.borrow(),
             settings.show_hidden,
             Sort {
                 column: column_named(&settings.sort_column),
                 descending: settings.sort_descending,
             },
-            &self.rust().icons,
         );
 
-        let count = rows.len() as i32;
+        let objects = rows.into_iter().map(glib::BoxedAnyObject::new).collect::<Vec<_>>();
 
-        unsafe { self.as_mut().begin_reset_model() };
-        self.as_mut().rust_mut().rows = rows;
-        unsafe { self.as_mut().end_reset_model() };
+        self.store.splice(0, self.store.n_items(), &objects);
+        self.announce();
+    }
 
-        self.as_mut().set_count(count);
+    fn announce(&self) {
+        // The list is copied before anything is called, so an observer is free to add another
+        // without tripping over the borrow it is being called under.
+        let observers = self.observers.borrow().clone();
+
+        for observer in observers {
+            observer();
+        }
     }
 }
 
@@ -673,7 +486,6 @@ fn merge(
     here: &RemotePath,
     showing_hidden: bool,
     sort: Sort,
-    icons: &crate::icons::Icons,
 ) -> Vec<Row> {
     // Cloned handles, not files: this is a list of pointers being sorted.
     let mut entries = entries.to_vec();
@@ -692,14 +504,7 @@ fn merge(
     let mut rows = entries
         .into_iter()
         .filter(|entry| showing_hidden || !entry.is_hidden())
-        .map(|entry| {
-            Row::new(
-                icons.for_file(&entry.name, entry.kind.is_folder()),
-                landing_here(&entry.name).and_then(Arriving::fraction),
-                now,
-                entry,
-            )
-        })
+        .map(|entry| Row::new(landing_here(&entry.name).and_then(Arriving::fraction), now, entry))
         .collect::<Vec<_>>();
 
     for arriving in arriving {
@@ -712,7 +517,6 @@ fn merge(
         }
 
         rows.push(Row::new(
-            icons.for_file(&arriving.name, false),
             arriving.fraction(),
             now,
             Arc::new(Entry::file(&arriving.name, arriving.total.unwrap_or_default())),
@@ -740,14 +544,7 @@ mod tests {
     fn merged(entries: &[Entry], arriving: &[Arriving], here: &str) -> Vec<Row> {
         let entries = entries.iter().cloned().map(Arc::new).collect::<Vec<_>>();
 
-        merge(
-            &entries,
-            arriving,
-            &RemotePath::parse(here).unwrap(),
-            false,
-            Sort::by_name(),
-            &crate::icons::Icons::in_themes(Vec::new()),
-        )
+        merge(&entries, arriving, &RemotePath::parse(here).unwrap(), false, Sort::by_name())
     }
 
     #[test]
@@ -830,6 +627,17 @@ mod tests {
 
         let names = rows.iter().map(|row| row.entry.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, vec!["a", "a", "b"]);
-        assert!(rows[0].entry.kind.is_folder());
+        assert!(rows[0].is_folder());
+    }
+
+    /// The columns are worked out once, when the row is built, so the view reads them rather
+    /// than working them out on every pass.
+    #[test]
+    fn a_row_carries_its_columns_ready_to_draw() {
+        let rows = merged(&[Entry::file("invoice.pdf", 250_000)], &[], "/");
+
+        assert_eq!(rows[0].kind.label, "PDF document");
+        assert_eq!(rows[0].size, "244 KB");
+        assert!(!rows[0].uploading());
     }
 }

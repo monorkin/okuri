@@ -9,14 +9,10 @@ pkgdesc="Dead-simple file transfer for Omarchy & Linux (prebuilt binary)"
 arch=('x86_64')
 url="https://github.com/monorkin/okuri"
 license=('MIT')
-# A lower bound only. Qt keeps binary compatibility across Qt 6 minor releases, so the linking
-# side is safe; what this binary is really tied to is the compiled-QML data structure version,
-# which Qt bumps when that layout changes rather than on every release. An upper bound would
-# trade that occasional break for a certain one — the package refusing to install after every
-# Qt bump, broken or not. If a bump ever does break it, republish with a new pkgrel.
-depends=('glibc' 'gcc-libs'
-         "qt6-base>=@QT_SERIES@"
-         "qt6-declarative>=@QT_SERIES@")
+# A lower bound only: the GTK and libadwaita the binary is built against (the `v4_12` and
+# `v1_5` features in crates/okuri/Cargo.toml). Both keep binary compatibility across minor
+# releases, so a newer one runs this fine; an older one is what would be missing symbols.
+depends=('glibc' 'gcc-libs' 'gtk4>=4.12' 'libadwaita>=1.5')
 provides=('okuri')
 conflicts=('okuri')
 options=('!debug')

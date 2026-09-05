@@ -10,9 +10,8 @@ description = "Remote storage that feels like a folder"
 okuri-core.workspace = true
 okuri-engine.workspace = true
 okuri-providers.workspace = true
-cxx = "1.0"
-cxx-qt = "0.10"
-cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 # `local-offset` so modification times can be shown on the clock the person keeps rather than
 # in UTC. It is read once, first thing in `main`, which is the only moment it is allowed.
 time = { workspace = true, features = ["local-offset"] }
@@ -20,9 +19,6 @@ toml = "0.9"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 notify = "8.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
-
-[build-dependencies]
-cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

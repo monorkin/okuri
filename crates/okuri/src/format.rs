@@ -88,29 +88,6 @@ fn month(at: OffsetDateTime) -> &'static str {
     }
 }
 
-
-/// A file:// URL as a path, which is what a drop from a file manager hands us.
-pub fn path_from_url(url: &str) -> Option<std::path::PathBuf> {
-    let path = url.strip_prefix("file://")?;
-
-    // A drop carries percent-encoded bytes, and a file named "my file.txt" is entirely normal.
-    let mut decoded = Vec::with_capacity(path.len());
-    let mut characters = path.bytes();
-
-    while let Some(byte) = characters.next() {
-        if byte == b'%' {
-            let digits = [characters.next()?, characters.next()?];
-            let text = std::str::from_utf8(&digits).ok()?;
-
-            decoded.push(u8::from_str_radix(text, 16).ok()?);
-        } else {
-            decoded.push(byte);
-        }
-    }
-
-    Some(std::path::PathBuf::from(String::from_utf8(decoded).ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,22 +120,5 @@ mod tests {
         let now = datetime!(2026-08-28 14:30 UTC);
 
         assert_eq!(modified(datetime!(2026-09-04 09:05 UTC), now), "4 Sep");
-    }
-
-    #[test]
-    fn dropped_urls_become_paths() {
-        assert_eq!(
-            path_from_url("file:///home/me/notes.txt"),
-            Some("/home/me/notes.txt".into())
-        );
-        assert_eq!(
-            path_from_url("file:///home/me/my%20file.txt"),
-            Some("/home/me/my file.txt".into())
-        );
-        assert_eq!(
-            path_from_url("file:///home/me/caf%C3%A9.txt"),
-            Some("/home/me/café.txt".into())
-        );
-        assert_eq!(path_from_url("https://example.com/notes.txt"), None);
     }
 }

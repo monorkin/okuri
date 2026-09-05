@@ -1,0 +1,228 @@
+/* Drawn entirely from the palette defined above it. Nothing here names a colour of its own. */
+
+.okuri-title {
+  font-size: 17px;
+  color: @okuri_bright;
+}
+
+.okuri-muted {
+  color: @okuri_muted;
+}
+
+.okuri-small {
+  font-size: 12px;
+}
+
+.okuri-grave {
+  color: @okuri_error;
+}
+
+.okuri-warning {
+  color: @okuri_warning;
+}
+
+.okuri-detail {
+  background: @okuri_surface;
+  padding: 10px;
+  border-radius: 6px;
+  font-family: monospace;
+}
+
+/* The strip along the bottom: coloured like what it is, and the loudest thing on screen for
+   as long as it is there. */
+.okuri-notice {
+  padding: 6px 8px 6px 16px;
+  border-top: 1px solid @okuri_error;
+  background: alpha(@okuri_error, 0.22);
+  color: @okuri_bright;
+}
+
+.okuri-notice.good {
+  border-top-color: @okuri_success;
+  background: alpha(@okuri_success, 0.22);
+}
+
+/* The file list, as rows and as a grid. Both are painted from the same three colours, so
+   switching between them changes the layout and nothing else. */
+.okuri-files row,
+.okuri-files child {
+  padding: 0;
+}
+
+.okuri-files row:hover,
+.okuri-files child:hover {
+  background: @okuri_surface;
+}
+
+.okuri-files row:selected,
+.okuri-files child:selected {
+  background: @okuri_selection;
+  color: @okuri_selection_text;
+}
+
+.okuri-files row:selected .okuri-muted,
+.okuri-files child:selected .okuri-muted {
+  color: @okuri_selection_text;
+}
+
+/* A folder that will take what is being dragged, and the folder you are looking at when the
+   drop is going into it. */
+.okuri-files row:drop(active),
+.okuri-files child:drop(active),
+.okuri-crumb:drop(active) {
+  outline: 2px solid @okuri_accent;
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+.okuri-files:drop(active),
+.okuri-browser:drop(active) {
+  outline: 2px solid @okuri_accent;
+  outline-offset: -6px;
+  border-radius: 8px;
+}
+
+.okuri-browser:drop(active) {
+  background: alpha(@okuri_accent, 0.08);
+}
+
+/* The column headings: quiet, and only the sorted one says which way. */
+.okuri-header {
+  padding: 8px 14px;
+  border-bottom: 1px solid @okuri_border;
+}
+
+.okuri-header button {
+  padding: 0;
+  min-height: 20px;
+  font-weight: normal;
+  color: @okuri_muted;
+  background: none;
+  box-shadow: none;
+  border: none;
+}
+
+.okuri-header button:hover {
+  color: @okuri_foreground;
+}
+
+/* The path, drawn as the bar a file manager draws it in. */
+.okuri-trail {
+  background: alpha(@okuri_foreground, 0.08);
+  border-radius: 6px;
+  padding: 0 6px;
+}
+
+.okuri-trail > * > * {
+  background: none;
+}
+
+.okuri-crumb {
+  padding: 2px 8px;
+  min-height: 24px;
+  color: @okuri_muted;
+}
+
+.okuri-crumb:hover {
+  color: @okuri_foreground;
+}
+
+.okuri-crumb.current {
+  color: @okuri_foreground;
+  font-weight: bold;
+}
+
+/* What a drag carries: the file as a pill, on nothing. */
+dragicon {
+  background: none;
+}
+
+.okuri-chip {
+  background: @okuri_elevated;
+  color: @okuri_foreground;
+  border: 1px solid @okuri_border;
+  border-radius: 999px;
+  padding: 5px 14px 5px 8px;
+  box-shadow: 0 2px 8px alpha(@okuri_background, 0.5);
+}
+
+/* Something on its way is not here yet, and looks it. */
+.okuri-uploading {
+  opacity: 0.5;
+}
+
+.okuri-progress {
+  min-height: 2px;
+}
+
+.okuri-progress trough {
+  min-height: 2px;
+  background: @okuri_border;
+  border: none;
+}
+
+.okuri-progress progress {
+  min-height: 2px;
+  background: @okuri_accent;
+  border: none;
+}
+
+/* What is not there yet, drawn as the shape of what will be. */
+.okuri-placeholder {
+  min-height: 10px;
+  min-width: 140px;
+  border-radius: 3px;
+  background: alpha(@okuri_foreground, 0.10);
+  animation: okuri-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes okuri-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.4; }
+  100% { opacity: 1; }
+}
+
+.okuri-copyable {
+  padding: 0;
+  min-height: 0;
+}
+
+.okuri-copyable:hover label {
+  color: @okuri_accent;
+}
+
+/* The line under the title on the start screen, fading either side of a change of words. */
+.okuri-subtitle {
+  transition: opacity 180ms ease-out;
+}
+
+.okuri-subtitle.okuri-faded {
+  opacity: 0;
+}
+
+/* A saved connection, picked, in the same colours as a picked file. */
+.okuri-connection:selected {
+  background: @okuri_selection;
+  color: @okuri_selection_text;
+}
+
+.okuri-connection:selected .okuri-muted {
+  color: @okuri_selection_text;
+}
+
+/* A saved connection's Edit button is there when the pointer is, and only then. */
+.okuri-connection .okuri-edit {
+  opacity: 0;
+}
+
+.okuri-connection:hover .okuri-edit {
+  opacity: 1;
+}
+
+.okuri-connection.opening .okuri-edit {
+  opacity: 0;
+}
+
+.okuri-tick {
+  min-width: 78px;
+}

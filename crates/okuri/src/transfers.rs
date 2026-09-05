@@ -1,270 +1,165 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::pin::Pin;
+use std::rc::Rc;
 
+use adw::prelude::*;
+use gtk::{gio, glib};
+use okuri_engine::engine::Command;
 use okuri_engine::event::Outcome;
 use okuri_engine::transfer::{Direction, State, Transfer, TransferId};
 use okuri_engine::Event;
-use cxx_qt::{CxxQtType, Threading};
-use cxx_qt_lib::{
-    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
-};
 
 use crate::format;
 
 /// The transfer queue, as the toolbar button and its window show it.
-#[cxx_qt::bridge]
-pub mod qobject {
-    unsafe extern "C++" {
-        include!("cxx-qt-lib/qstring.h");
-        type QString = cxx_qt_lib::QString;
-        include!("cxx-qt-lib/qvariant.h");
-        type QVariant = cxx_qt_lib::QVariant;
-        include!("cxx-qt-lib/qmodelindex.h");
-        type QModelIndex = cxx_qt_lib::QModelIndex;
-        include!("cxx-qt-lib/qhash.h");
-        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
-        include!("cxx-qt-lib/qlist.h");
-        type QList_i32 = cxx_qt_lib::QList<i32>;
-    }
-
-    unsafe extern "C++Qt" {
-        include!(<QtCore/QAbstractListModel>);
-
-        type QAbstractListModel = crate::qt::qobject::QAbstractListModel;
-    }
-
-    #[auto_cxx_name]
-    extern "RustQt" {
-        #[qobject]
-        #[qml_element]
-        #[base = QAbstractListModel]
-        /// How many transfers are still going, which is what the toolbar badge shows.
-        #[qproperty(i32, active)]
-        #[qproperty(i32, count)]
-        type Transfers = super::TransfersRust;
-
-        #[qinvokable]
-        #[cxx_override]
-        fn data(self: &Transfers, index: &QModelIndex, role: i32) -> QVariant;
-
-        #[qinvokable]
-        #[cxx_override]
-        #[cxx_name = "rowCount"]
-        fn row_count(self: &Transfers, parent: &QModelIndex) -> i32;
-
-        #[qinvokable]
-        #[cxx_override]
-        #[cxx_name = "roleNames"]
-        fn role_names(self: &Transfers) -> QHash_i32_QByteArray;
-
-        /// Drops everything that has already finished, so the window shows what is happening
-        /// rather than what happened.
-        #[qinvokable]
-        fn clear_finished(self: Pin<&mut Transfers>);
-
-        #[qinvokable]
-        fn id_at(self: &Transfers, row: i32) -> i64;
-    }
-
-    unsafe extern "RustQt" {
-        #[inherit]
-        #[cxx_name = "beginResetModel"]
-        unsafe fn begin_reset_model(self: Pin<&mut Transfers>);
-
-        #[inherit]
-        #[cxx_name = "endResetModel"]
-        unsafe fn end_reset_model(self: Pin<&mut Transfers>);
-
-        #[inherit]
-        #[cxx_name = "dataChanged"]
-        unsafe fn data_changed(
-            self: Pin<&mut Transfers>,
-            top_left: &QModelIndex,
-            bottom_right: &QModelIndex,
-            roles: &QList_i32,
-        );
-
-        #[inherit]
-        fn index(self: &Transfers, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex;
-    }
-
-    impl cxx_qt::Threading for Transfers {}
-
-    impl cxx_qt::Initialize for Transfers {}
+///
+/// One for the process rather than one per window. The queue is one queue for the whole
+/// application, and a transfer started in one window is still moving when that window is
+/// looking at something else — or has been closed.
+pub struct Transfers {
+    pub store: gio::ListStore,
+    rows: RefCell<HashMap<TransferId, u32>>,
+    observers: RefCell<Vec<Rc<dyn Fn() -> bool>>>,
 }
 
-const USER_ROLE: i32 = 0x0100;
-
-const NAME: i32 = USER_ROLE;
-const STATUS: i32 = USER_ROLE + 1;
-const FRACTION: i32 = USER_ROLE + 2;
-const DIRECTION: i32 = USER_ROLE + 3;
-const RUNNING: i32 = USER_ROLE + 4;
-
-#[derive(Default)]
-pub struct TransfersRust {
-    active: i32,
-    count: i32,
-    queue: Vec<Transfer>,
-    rows: HashMap<TransferId, usize>,
+thread_local! {
+    static QUEUE: Rc<Transfers> = Transfers::start();
 }
 
-impl cxx_qt::Initialize for qobject::Transfers {
-    fn initialize(self: Pin<&mut Self>) {
-        let thread = self.qt_thread();
+pub fn queue() -> Rc<Transfers> {
+    QUEUE.with(Rc::clone)
+}
 
-        crate::bus::listen(move |event| match event.as_ref() {
-            Event::TransferAdded(transfer) => {
-                let transfer = transfer.clone();
+impl Transfers {
+    fn start() -> Rc<Self> {
+        let transfers = Rc::new(Self {
+            store: gio::ListStore::new::<glib::BoxedAnyObject>(),
+            rows: RefCell::new(HashMap::new()),
+            observers: RefCell::new(Vec::new()),
+        });
 
-                crate::qt::queue(&thread, move |model| model.add(transfer));
-            }
-            Event::TransferProgress { transfer, transferred } => {
-                let (id, transferred) = (*transfer, *transferred);
+        // Kept for as long as the process runs: the queue outlives every window.
+        let queue = Rc::clone(&transfers);
 
-                crate::qt::queue(&thread, move |model| model.advance(id, transferred));
-            }
-            Event::TransferFinished { transfer, outcome } => {
-                let (id, outcome) = (*transfer, outcome.clone());
-
-                crate::qt::queue(&thread, move |model| model.finish(id, outcome));
-            }
+        crate::relay::on_event(move |event| match event.as_ref() {
+            Event::TransferAdded(transfer) => queue.add(transfer.clone()),
+            Event::TransferProgress { transfer, transferred } => queue.advance(*transfer, *transferred),
+            Event::TransferFinished { transfer, outcome } => queue.finish(*transfer, outcome.clone()),
             _ => {}
         })
         .forever();
-    }
-}
 
-impl qobject::Transfers {
-    pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
-        let Some(transfer) = self.rust().queue.get(index.row() as usize) else {
-            return QVariant::default();
-        };
-
-        match role {
-            NAME => QVariant::from(&QString::from(&transfer.name)),
-            STATUS => QVariant::from(&QString::from(&status(transfer))),
-            FRACTION => QVariant::from(&transfer.fraction().unwrap_or(0.0)),
-            DIRECTION => QVariant::from(&QString::from(match transfer.direction {
-                Direction::Upload => "upload",
-                Direction::Download => "download",
-                Direction::Between => "between",
-            })),
-            RUNNING => QVariant::from(&!transfer.state.is_finished()),
-            _ => QVariant::default(),
-        }
+        transfers
     }
 
-    pub fn row_count(&self, _parent: &QModelIndex) -> i32 {
-        self.rust().queue.len() as i32
+    /// Calls `observer` whenever the queue changes, until it answers `false` — which is how an
+    /// observer says the thing it was updating has gone.
+    pub fn on_change(&self, observer: impl Fn() -> bool + 'static) {
+        self.observers.borrow_mut().push(Rc::new(observer));
     }
 
-    pub fn role_names(&self) -> QHash<QHashPair_i32_QByteArray> {
-        let mut names = QHash::<QHashPair_i32_QByteArray>::default();
-
-        names.insert(NAME, QByteArray::from("name"));
-        names.insert(STATUS, QByteArray::from("status"));
-        names.insert(FRACTION, QByteArray::from("fraction"));
-        names.insert(DIRECTION, QByteArray::from("direction"));
-        names.insert(RUNNING, QByteArray::from("running"));
-
-        names
+    /// How many transfers are still going, which is what the toolbar badge shows.
+    pub fn active(&self) -> u32 {
+        (0..self.count())
+            .filter(|row| self.with_row(*row, |transfer| !transfer.state.is_finished()).unwrap_or(false))
+            .count() as u32
     }
 
-    pub fn clear_finished(mut self: Pin<&mut Self>) {
-        unsafe { self.as_mut().begin_reset_model() };
-        self.as_mut()
-            .rust_mut()
-            .queue
-            .retain(|transfer| !transfer.state.is_finished());
-        self.as_mut().reindex();
-        unsafe { self.as_mut().end_reset_model() };
-
-        self.recount();
+    pub fn count(&self) -> u32 {
+        self.store.n_items()
     }
 
-    pub fn id_at(&self, row: i32) -> i64 {
-        usize::try_from(row)
-            .ok()
-            .and_then(|row| self.rust().queue.get(row))
-            .map(|transfer| transfer.id.0 as i64)
-            .unwrap_or(-1)
+    /// Drops everything that has already finished, so the window shows what is happening
+    /// rather than what happened.
+    pub fn clear_finished(&self) {
+        let kept = (0..self.count())
+            .filter_map(|row| self.store.item(row))
+            .filter(|object| {
+                object
+                    .downcast_ref::<glib::BoxedAnyObject>()
+                    .is_some_and(|object| !object.borrow::<Transfer>().state.is_finished())
+            })
+            .collect::<Vec<_>>();
+
+        self.store.splice(0, self.count(), &kept);
+        self.reindex();
+        self.announce();
     }
 
-    fn add(mut self: Pin<&mut Self>, transfer: Transfer) {
-        unsafe { self.as_mut().begin_reset_model() };
-        self.as_mut().rust_mut().queue.push(transfer);
-        self.as_mut().reindex();
-        unsafe { self.as_mut().end_reset_model() };
-
-        self.recount();
+    pub fn id_at(&self, row: u32) -> Option<TransferId> {
+        self.with_row(row, |transfer| transfer.id)
     }
 
-    /// Progress is the one thing that changes often, so it updates the single row it belongs to
-    /// rather than resetting the model and losing the user's scroll position.
-    fn advance(mut self: Pin<&mut Self>, id: TransferId, transferred: u64) {
-        let Some(row) = self.rust().rows.get(&id).copied() else {
-            return;
-        };
+    pub fn cancel(&self, id: TransferId) {
+        crate::running::engine().send(Command::CancelTransfer(id));
+    }
 
-        if let Some(transfer) = self.as_mut().rust_mut().queue.get_mut(row) {
+    pub fn with_row<T>(&self, row: u32, read: impl FnOnce(&Transfer) -> T) -> Option<T> {
+        let object = self.store.item(row)?.downcast::<glib::BoxedAnyObject>().ok()?;
+        let transfer = object.borrow::<Transfer>();
+
+        Some(read(&transfer))
+    }
+
+    fn add(&self, transfer: Transfer) {
+        self.store.append(&glib::BoxedAnyObject::new(transfer));
+        self.reindex();
+        self.announce();
+    }
+
+    /// Progress is the one thing that changes often, so it touches the single row it belongs
+    /// to rather than replacing the list and losing the scroll position.
+    fn advance(&self, id: TransferId, transferred: u64) {
+        self.touch(id, |transfer| {
             transfer.transferred = transferred;
             transfer.state = State::Running;
-        }
-
-        self.touch(row as i32);
+        });
     }
 
-    fn finish(mut self: Pin<&mut Self>, id: TransferId, outcome: Outcome) {
-        let Some(row) = self.rust().rows.get(&id).copied() else {
-            return;
-        };
-
-        if let Some(transfer) = self.as_mut().rust_mut().queue.get_mut(row) {
+    fn finish(&self, id: TransferId, outcome: Outcome) {
+        self.touch(id, |transfer| {
             transfer.state = match outcome {
                 Outcome::Done => State::Done,
                 Outcome::Failed(reason) => State::Failed(reason),
                 Outcome::Cancelled => State::Cancelled,
             };
+        });
+
+        self.announce();
+    }
+
+    fn touch(&self, id: TransferId, change: impl FnOnce(&mut Transfer)) {
+        let Some(row) = self.rows.borrow().get(&id).copied() else {
+            return;
+        };
+
+        if let Some(object) = self.store.item(row).and_downcast::<glib::BoxedAnyObject>() {
+            change(&mut object.borrow_mut::<Transfer>());
         }
 
-        self.as_mut().touch(row as i32);
-        self.recount();
+        self.store.items_changed(row, 1, 1);
     }
 
-    fn touch(mut self: Pin<&mut Self>, row: i32) {
-        let at = self.index(row, 0, &QModelIndex::default());
-
-        unsafe { self.as_mut().data_changed(&at, &at, &QList::<i32>::default()) };
-    }
-
-    fn reindex(mut self: Pin<&mut Self>) {
-        let rows = self
-            .rust()
-            .queue
-            .iter()
-            .enumerate()
-            .map(|(row, transfer)| (transfer.id, row))
+    fn reindex(&self) {
+        let rows = (0..self.count())
+            .filter_map(|row| Some((self.id_at(row)?, row)))
             .collect();
 
-        self.as_mut().rust_mut().rows = rows;
+        *self.rows.borrow_mut() = rows;
     }
 
-    fn recount(mut self: Pin<&mut Self>) {
-        let active = self
-            .rust()
-            .queue
-            .iter()
-            .filter(|transfer| !transfer.state.is_finished())
-            .count() as i32;
-        let count = self.rust().queue.len() as i32;
+    fn announce(&self) {
+        // The list is copied before anything is called, so an observer is free to add another
+        // without tripping over the borrow it is being called under.
+        let observers = self.observers.borrow().clone();
+        let alive = observers.into_iter().filter(|observer| observer()).collect::<Vec<_>>();
 
-        self.as_mut().set_active(active);
-        self.as_mut().set_count(count);
+        *self.observers.borrow_mut() = alive;
     }
 }
 
-fn status(transfer: &Transfer) -> String {
+/// What a row says under its name.
+pub fn status(transfer: &Transfer) -> String {
     match &transfer.state {
         State::Queued => "Waiting".to_owned(),
         State::Running => match transfer.total {
@@ -278,5 +173,194 @@ fn status(transfer: &Transfer) -> String {
         State::Done => format::size(transfer.transferred),
         State::Failed(reason) => reason.clone(),
         State::Cancelled => "Cancelled".to_owned(),
+    }
+}
+
+/// The queue, on screen.
+pub fn present(parent: &impl IsA<gtk::Widget>) {
+    let transfers = queue();
+
+    let dialog = adw::Dialog::builder()
+        .title("Transfers")
+        .content_width(560)
+        .content_height(420)
+        .build();
+
+    let header = adw::HeaderBar::new();
+    let clear = gtk::Button::with_label("Clear finished");
+    header.pack_end(&clear);
+
+    let progress = gtk::Label::new(None);
+    progress.set_xalign(0.0);
+    header.set_title_widget(Some(&progress));
+
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup({
+        let transfers = Rc::clone(&transfers);
+
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+            item.set_child(Some(&TransferCell::new(item, &transfers).root));
+            item.set_selectable(false);
+            item.set_activatable(false);
+        }
+    });
+
+    factory.connect_bind({
+        let transfers = Rc::clone(&transfers);
+
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+            let Some(cell) = item.child().and_then(|child| TransferCell::from_root(&child)) else {
+                return;
+            };
+
+            transfers.with_row(item.position(), |transfer| cell.show(transfer));
+        }
+    });
+
+    let list = gtk::ListView::new(
+        Some(gtk::NoSelection::new(Some(transfers.store.clone()))),
+        Some(factory),
+    );
+    list.add_css_class("okuri-transfers");
+
+    let empty = gtk::Label::new(Some("Drag files into the window to upload them."));
+    empty.add_css_class("okuri-muted");
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).build()));
+    overlay.add_overlay(&empty);
+
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&header);
+    content.set_content(Some(&overlay));
+    dialog.set_child(Some(&content));
+
+    // What the header says follows the queue for as long as the dialog is open, and stops
+    // being asked the moment it is not.
+    let refresh = {
+        let (progress, clear, empty) = (progress.downgrade(), clear.downgrade(), empty.downgrade());
+        let transfers = Rc::clone(&transfers);
+
+        move || {
+            let (Some(progress), Some(clear), Some(empty)) =
+                (progress.upgrade(), clear.upgrade(), empty.upgrade())
+            else {
+                return false;
+            };
+
+            let active = transfers.active();
+
+            progress.set_text(&match active {
+                0 => "Nothing in progress".to_owned(),
+                active => format!("{active} in progress"),
+            });
+            clear.set_sensitive(transfers.count() > active);
+            empty.set_visible(transfers.count() == 0);
+
+            true
+        }
+    };
+
+    refresh();
+    transfers.on_change(refresh);
+
+    clear.connect_clicked({
+        let transfers = Rc::clone(&transfers);
+
+        move |_| transfers.clear_finished()
+    });
+
+    dialog.present(Some(parent));
+}
+
+/// One transfer, as a row of the queue.
+struct TransferCell {
+    root: gtk::Box,
+    name: gtk::Label,
+    bar: gtk::ProgressBar,
+    status: gtk::Label,
+    cancel: gtk::Button,
+}
+
+impl TransferCell {
+    /// Built once per list item and bound to whichever transfer scrolls into it. The item is
+    /// what the Cancel button asks which transfer it is sitting on, because the widgets are
+    /// reused and the answer changes under them.
+    fn new(item: &gtk::ListItem, transfers: &Rc<Transfers>) -> Self {
+        let name = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+
+        let bar = gtk::ProgressBar::new();
+        bar.add_css_class("okuri-progress");
+
+        let status = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["okuri-muted", "okuri-small"])
+            .build();
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        column.set_hexpand(true);
+        column.set_valign(gtk::Align::Center);
+        column.append(&name);
+        column.append(&bar);
+        column.append(&status);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.set_valign(gtk::Align::Center);
+        cancel.add_css_class("flat");
+
+        cancel.connect_clicked({
+            let item = item.downgrade();
+            let transfers = Rc::clone(transfers);
+
+            move |_| {
+                if let Some(id) = item.upgrade().and_then(|item| transfers.id_at(item.position())) {
+                    transfers.cancel(id);
+                }
+            }
+        });
+
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(10)
+            .margin_start(18)
+            .margin_end(12)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+        root.append(&column);
+        root.append(&cancel);
+
+        Self { root, name, bar, status, cancel }
+    }
+
+    /// The same widgets back, from the one the list item holds.
+    fn from_root(root: &gtk::Widget) -> Option<Self> {
+        let root = root.downcast_ref::<gtk::Box>()?.clone();
+        let column = root.first_child()?.downcast::<gtk::Box>().ok()?;
+        let name = column.first_child()?.downcast::<gtk::Label>().ok()?;
+        let bar = name.next_sibling()?.downcast::<gtk::ProgressBar>().ok()?;
+        let status = bar.next_sibling()?.downcast::<gtk::Label>().ok()?;
+        let cancel = column.next_sibling()?.downcast::<gtk::Button>().ok()?;
+
+        Some(Self { root, name, bar, status, cancel })
+    }
+
+    fn show(&self, transfer: &Transfer) {
+        let arrow = match transfer.direction {
+            Direction::Download => "↓ ",
+            Direction::Upload | Direction::Between => "↑ ",
+        };
+
+        self.name.set_text(&format!("{arrow}{}", transfer.name));
+        self.bar.set_fraction(transfer.fraction().unwrap_or(0.0));
+        self.bar.set_visible(!transfer.state.is_finished());
+        self.status.set_text(&status(transfer));
+        self.cancel.set_visible(!transfer.state.is_finished());
     }
 }

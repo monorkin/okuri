@@ -84,7 +84,6 @@ publish_bin() {
       -e "s/@ICON_64_SHA256@/$(sha256_file assets/icons/$BINARY-64.png)/" \
       -e "s/@ICON_128_SHA256@/$(sha256_file assets/icons/$BINARY-128.png)/" \
       -e "s/@ICON_256_SHA256@/$(sha256_file assets/icons/$BINARY-256.png)/" \
-      -e "s/@QT_SERIES@/$(qt_series)/" \
       packaging/aur/PKGBUILD-bin > "$WORKDIR/$BINARY-bin/PKGBUILD"
   cp LICENSE "packaging/$BINARY.desktop" "$WORKDIR/$BINARY-bin/"
 

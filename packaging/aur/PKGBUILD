@@ -8,16 +8,9 @@ pkgdesc="Dead-simple file transfer for Omarchy & Linux"
 arch=('x86_64' 'aarch64')
 url="https://github.com/monorkin/okuri"
 license=('MIT')
-depends=('qt6-base' 'qt6-declarative' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'qt6-base' 'qt6-declarative')
-# The QML is compiled ahead of time against whichever Qt is installed when this is built, so an
-# install picks up the Qt of the day. Nothing rebuilds it later — the AUR has no build farm, and
-# a Qt minor bump leaves the soname alone, so checkrebuild will not spot it either. If a Qt
-# release ever does break the compiled QML, it takes a pkgrel bump here, same as the -bin one.
-#
-# !lto because makepkg's -flto=auto hands GCC-LTO objects to the C++ glue cxx-qt generates,
-# which the linker Rust drives cannot read.
-options=('!lto' '!debug')
+depends=('gtk4>=4.12' 'libadwaita>=1.5' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'pkgconf')
+options=('!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('@TARBALL_SHA256@')
 

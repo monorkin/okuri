@@ -13,12 +13,3 @@ die() {
   echo "$*" >&2
   exit 1
 }
-
-# The Qt a prebuilt binary was built against, as a lower bound for the -bin package.
-#
-# Only a floor: Qt keeps binary compatibility across Qt 6 minor releases, so a newer Qt runs
-# this fine. An older one is what would be missing symbols.
-qt_series() {
-  command -v qmake6 >/dev/null || die "qmake6 is required to work out which Qt this was built against"
-  qmake6 -query QT_VERSION | cut -d. -f1,2
-}

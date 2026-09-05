@@ -25,9 +25,9 @@ install: build
 			$(DESTDIR)/usr/share/icons/hicolor/$${size}x$${size}/apps/$(BINARY).png; \
 	done
 
-# Only the host architecture, and deliberately no cross-compilation: the QML is compiled ahead
-# of time against the Qt doing the building, so a binary is only good for the Qt series it was
-# built with. Cross-building one would mean a cross Qt too, for a binary that goes stale anyway.
+# Only the host architecture, and deliberately no cross-compilation: GTK and libadwaita are
+# linked dynamically, and cross-building would mean a cross copy of both and everything under
+# them, for the one architecture anybody has asked for so far.
 dist: build
 	mkdir -p dist
 	cp target/release/$(BINARY) dist/$(BINARY)-linux-amd64

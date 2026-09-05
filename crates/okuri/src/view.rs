@@ -28,20 +28,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::List => "list",
-            Self::Grid => "grid",
-        }
-    }
-
-    pub fn parse(name: &str) -> Self {
-        match name {
-            "grid" => Self::Grid,
-            _ => Self::List,
-        }
-    }
-
     pub fn other(&self) -> Self {
         match self {
             Self::List => Self::Grid,
@@ -243,8 +229,6 @@ mod tests {
     fn the_mode_button_offers_the_other_one() {
         assert_eq!(Mode::List.other(), Mode::Grid);
         assert_eq!(Mode::Grid.other(), Mode::List);
-        assert_eq!(Mode::parse("grid"), Mode::Grid);
-        assert_eq!(Mode::parse("anything else"), Mode::List);
     }
 
     fn at_step(size_step: i32) -> Settings {

@@ -10,7 +10,7 @@ OS="$(uname -s)"
 case "$OS" in
   Linux*) OS="linux" ;;
   *)
-    echo "Error: Okuri is a Qt application for Linux, and this is $OS" >&2
+    echo "Error: Okuri is a GTK application for Linux, and this is $OS" >&2
     exit 1
     ;;
 esac
@@ -26,12 +26,13 @@ case "$ARCH" in
     ;;
 esac
 
-# Qt is linked dynamically, so a machine without it downloads a binary that cannot start. Say
-# so now rather than after the install, when the failure is a window that never opens.
-if ! ldconfig -p 2>/dev/null | grep -q libQt6Qml; then
-  echo "Error: Qt 6 is missing, and Okuri links against it" >&2
-  echo "On Arch:   sudo pacman -S qt6-base qt6-declarative" >&2
-  echo "On Debian: sudo apt install qt6-base-dev qt6-declarative-dev" >&2
+# GTK and libadwaita are linked dynamically, so a machine without them downloads a binary that
+# cannot start. Say so now rather than after the install, when the failure is a window that
+# never opens.
+if ! ldconfig -p 2>/dev/null | grep -q libadwaita-1; then
+  echo "Error: GTK 4 and libadwaita are missing, and Okuri links against them" >&2
+  echo "On Arch:   sudo pacman -S gtk4 libadwaita" >&2
+  echo "On Debian: sudo apt install libgtk-4-1 libadwaita-1-0" >&2
   exit 1
 fi
 
