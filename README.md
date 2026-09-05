@@ -13,7 +13,6 @@ Supports:
 - Azure Blob Storage
 - WebDAV
 
-
 ## Install
 
 **Omarchy:**
@@ -39,38 +38,42 @@ curl -fsSL https://raw.githubusercontent.com/monorkin/okuri/main/install.sh | ba
 
 Upload files by drag-and-dropping them into Okuri.
 
-https://github.com/user-attachments/assets/344c2f14-9de4-46a4-b971-f980992086d7
+https://github.com/user-attachments/assets/0d8ff82f-a97d-4fd2-875a-21ee834a1038
 
 ### Multiple windows
 
 Connect to multiple remotes at once, and drag-and-drop files between them.
 
-https://github.com/user-attachments/assets/ca734d76-817e-483a-a41e-118f1414f390
+https://github.com/user-attachments/assets/fe8f18f0-9fa4-4ea8-a33e-0c8776d0f59b
 
 ### Metadata
 
 Check every detail about a file and modify it, all from one place.
 
-<img width="720" height="599" alt="File view in Okuri" src="https://github.com/user-attachments/assets/827cf85c-2c48-4389-bab0-2153ecd81b17" />
+| Context | Screenshot |
+|-|-|
+| File actions | <img width="1261" height="1048" alt="okuri-file-actions" src="https://github.com/user-attachments/assets/9f94409c-4f4e-4714-9f14-b5a2e3f03777" /> |
+| FTP file options | <img width="1261" height="1048" alt="okuri-ftp-file-options" src="https://github.com/user-attachments/assets/0d31c371-cc68-49a5-9518-e0e5718337e1" /> |
+| S3 file options | <img width="1261" height="1048" alt="okuri-s3-file-options" src="https://github.com/user-attachments/assets/4d009e2e-6c05-4455-9a31-c03e4bab6208" /> |
 
 ### Omarchy themes
 
-Okuri has full theming support for Omarchy. It will adapt it's looks to whatever theme is currently set and updates live whenever the theme changes.
+Okuri has full theming support for Omarchy. It adapts its looks to whatever theme is currently set and updates live whenever the theme changes.
 
 Here are a few screenshots of Okuri in different Omarchy themes:
 
-| Theme | |
-|-|-|
-| Lupine | <img width="520" height="430" alt="Okuri in Lupine theme" src="https://github.com/user-attachments/assets/b9e82da1-7ff3-4376-a1ac-ad5de5158614" /> |
-| Rose Pine | <img width="520" height="430" alt="Okuri in Rose Pine theme" src="https://github.com/user-attachments/assets/c3be3aed-63e0-4990-871d-1de4655ed49a" /> |
-| White | <img width="520" height="430" alt="Okuri in White theme" src="https://github.com/user-attachments/assets/ae2da2a5-8406-41f8-8e3b-8aa869624563" /> |
-| Tokyo Night | <img width="520" height="430" alt="Okuri in Tokyo Night theme" src="https://github.com/user-attachments/assets/dd8058ff-64fc-4cba-a0dd-39de4f51634b" /> |
-| Retro 82 | <img width="520" height="430" alt="Okuri in Retro 82 theme" src="https://github.com/user-attachments/assets/4064700e-0049-46b9-b637-4b0c8890ccf0" /> |
-| Nord | <img width="520" height="430" alt="Okuri in Nord theme" src="https://github.com/user-attachments/assets/48b583c7-889a-465a-8cae-42c621d08974" /> |
-| Kanagawa | <img width="520" height="430" alt="Okuri in Kanagawa theme" src="https://github.com/user-attachments/assets/b5361a35-d0e3-4189-842a-bc689f70a187" /> |
-| Hackerman | <img width="520" height="430" alt="Okuri in Hackerman theme" src="https://github.com/user-attachments/assets/6d0a6356-7b3a-4cb7-b467-680f4b1536ac" /> |
-| Gruvbox | <img width="520" height="430" alt="Okuri in Gruvbox theme" src="https://github.com/user-attachments/assets/76fa7889-9a5f-4d38-828b-dad33a4cc4be" /> |
-| Catppuccin | <img width="520" height="430" alt="Okuri in Catppuccin theme" src="https://github.com/user-attachments/assets/a5e5cd71-1b87-4c05-8208-ee5347f192fd" /> |
+| Theme | Files | Menu |
+|-|-|-|
+| Lupine | <img width="1261" height="1048" alt="okuri-omarchy-theme-lupine-files" src="https://github.com/user-attachments/assets/e80e7a5f-07ba-43dc-89c8-63f19f80035f" /> | <img width="1266" height="1048" alt="okuri-omarchy-theme-lupine-menu" src="https://github.com/user-attachments/assets/031cccfa-b921-4c49-9a09-6d05e89790d1" /> |
+| Rose Pine | <img width="1261" height="1048" alt="okuri-omarchy-theme-rose-pine-files" src="https://github.com/user-attachments/assets/f1379bc3-8dda-4fcc-a0a5-c4d70d33b9fe" /> | <img width="1266" height="1048" alt="okuri-omarchy-theme-rose-pine-menu" src="https://github.com/user-attachments/assets/4979ff3d-ab60-494a-8d2a-d23d4ce7cbb4" /> |
+| Catppuccin Latte | <img width="1261" height="1048" alt="okuri-omarchy-theme-catppuccin-latte-files" src="https://github.com/user-attachments/assets/722abfc4-ec94-4a67-bb3b-0828189e063b" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-catppuccin-latte-menu" src="https://github.com/user-attachments/assets/cc829352-ea78-4ceb-b033-93f4295a1b52" /> |
+| Catppuccin | <img width="1261" height="1048" alt="okuri-omarchy-theme-catppuccin-files" src="https://github.com/user-attachments/assets/a382a680-aa0d-4922-8f9a-902208fbe34e" /> | <img width="1266" height="1048" alt="okuri-omarchy-theme-catppuccin-menu" src="https://github.com/user-attachments/assets/3f0199fb-0e60-430c-834d-defaea388025" /> |
+| Tokyo Night | <img width="1261" height="1048" alt="okuri-omarchy-theme-tokyo-night-files" src="https://github.com/user-attachments/assets/f7e9ffe8-fdad-4ab0-897e-6856a825d266" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-tokyo-night-menu" src="https://github.com/user-attachments/assets/f37cfebb-3b0a-4649-93f0-62dcac040948" /> |
+| Retro 82 | <img width="1261" height="1048" alt="okuri-omarchy-theme-retro-82-files" src="https://github.com/user-attachments/assets/66e0397c-80f8-40ee-a76c-4cc25ccd7f48" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-retro-82-menu" src="https://github.com/user-attachments/assets/3c717853-3716-4e6f-9488-f4bd28af32a9" /> |
+| Nord | <img width="1261" height="1048" alt="okuri-omarchy-theme-nord-files" src="https://github.com/user-attachments/assets/f9798e8a-0e9a-43d2-8c4d-cddf58daa2c6" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-nord-menu" src="https://github.com/user-attachments/assets/860579f0-3945-4278-aa8b-89db5e47eaec" /> |
+| Everforest | <img width="1261" height="1048" alt="okuri-omarchy-theme-everforest-files" src="https://github.com/user-attachments/assets/d302a0cd-ce21-401f-9bcd-c382799b681f" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-everforest-menu" src="https://github.com/user-attachments/assets/167f08a6-f14a-4c66-99f9-8decd272d079" /> |
+| Hackerman | <img width="1261" height="1048" alt="okuri-omarchy-theme-hackerman-files" src="https://github.com/user-attachments/assets/7673c1e8-2768-4b74-82bf-6e304e853f4f" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-hackerman-menu" src="https://github.com/user-attachments/assets/14ddb4f5-e6ae-45dd-b37e-21f75d332460" /> |
+| Last Horizon | <img width="1261" height="1048" alt="okuri-omarchy-theme-last-horizon-files" src="https://github.com/user-attachments/assets/6dcbebea-c32f-457a-91ff-f0ab2a590e89" /> | <img width="1261" height="1048" alt="okuri-omarchy-theme-last-horizon-menu" src="https://github.com/user-attachments/assets/f027b71f-020b-42c1-8126-05b3a5982d80" /> |
 
 ## For nerds
 
