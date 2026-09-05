@@ -37,9 +37,35 @@ impl FtpProvider {
 
     pub async fn connect(config: &FtpConfig, secret: &Secret) -> Result<Self> {
         let address = format!("{}:{}", config.host, config.port);
-        let mut stream = AsyncRustlsFtpStream::connect(&address)
+
+        // The socket is made here rather than by `connect`, only so that it can be told to send
+        // what is written to it instead of holding it back for a bundle. FTP's control channel
+        // is a conversation of very short lines, and every one of them held back waiting for
+        // company is a round trip added to a command that was ready to go.
+        let control = tokio::net::TcpStream::connect(&address)
             .await
             .map_err(|error| Error::caused_by(format!("could not reach {address}"), error))?;
+
+        control
+            .set_nodelay(true)
+            .map_err(|error| Error::caused_by("could not set up the connection", error))?;
+
+        let mut stream = AsyncRustlsFtpStream::connect_with_stream(control)
+            .await
+            .map_err(|error| Error::caused_by(format!("could not reach {address}"), error))?;
+
+        // And the same for every data connection, which is where the files themselves go.
+        stream = stream.passive_stream_builder(|address| {
+            Box::pin(async move {
+                let data = tokio::net::TcpStream::connect(address)
+                    .await
+                    .map_err(FtpError::ConnectionError)?;
+
+                data.set_nodelay(true).map_err(FtpError::ConnectionError)?;
+
+                Ok(data)
+            })
+        });
 
         if config.encrypted {
             stream = stream

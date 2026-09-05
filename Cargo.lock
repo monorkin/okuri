@@ -3131,6 +3131,7 @@ dependencies = [
  "bytes",
  "futures",
  "hmac 0.12.1",
+ "http-body 1.1.0",
  "okuri-core",
  "percent-encoding",
  "quick-xml",
@@ -3144,7 +3145,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls 0.26.4",
- "tokio-util",
  "toml 0.9.12+spec-1.1.0",
 ]
 
@@ -4828,7 +4828,6 @@ checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
  "futures-util",
  "libc",

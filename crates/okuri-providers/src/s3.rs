@@ -12,11 +12,11 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use okuri_core::{
     ByteRange, ByteStream, Capabilities, Entry, Error, Provider, RemotePath, Result, Serve,
     Served, Serving, Sharing, Stored, Storing, Visibility,
 };
-use futures::StreamExt;
 use time::OffsetDateTime;
 
 use crate::destination::S3 as S3Config;
@@ -38,13 +38,40 @@ pub struct S3Provider {
     /// the connection resolved it, because a preset and a self-hosted store disagree about
     /// what the host even is.
     endpoint: String,
+    /// How much memory every part in flight on this connection shares between them.
+    budget: crate::parts::Budget,
 }
 
-/// Anything smaller goes up in one request; anything larger is split into parts of this size.
+/// Above this an object is split rather than sent or fetched in one request.
 ///
 /// Comfortably above the five megabytes S3 requires of every part but the last, so a file just
 /// over the threshold still splits into parts the service will accept.
 const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// What S3 will take of one object, as the service documents it.
+///
+/// The smallest is what Okuri will use rather than what S3 requires — the requirement is five
+/// megabytes, and starting a little above it is what keeps a file just over the threshold legal.
+const LIMITS: crate::parts::Limits = crate::parts::Limits {
+    smallest: PART_SIZE,
+    largest: 5 * 1024 * 1024 * 1024,
+    most: 10_000,
+};
+
+/// How many objects are copied at once when a folder is renamed.
+///
+/// A rename here is a copy of every object under a prefix and then a delete. A copy is work the
+/// store does entirely on its own, so asking for the next only once the last has answered spends
+/// the whole rename on round trips. Bounded so renaming a folder of ten thousand objects does
+/// not become ten thousand requests at once.
+const COPIES_AT_ONCE: usize = 4;
+
+/// Above this, an object comes down as several ranges asked for at once.
+///
+/// One GET runs at whatever a single connection manages, and across a long link that is a
+/// fraction of what the store would give: the round trip decides how much can be in the air,
+/// not the bandwidth. Below this the extra requests cost more than they save.
+const IN_PIECES_ABOVE: u64 = 64 * 1024 * 1024;
 
 /// The zero-byte object whose key ends in `/`, which is how every S3 client agrees to write
 /// down a folder that has nothing in it yet.
@@ -92,6 +119,7 @@ impl S3Provider {
                 .resolved_endpoint()
                 .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", region_for_urls)),
             client: Client::from_conf(builder.build()),
+            budget: crate::parts::Budget::new(),
         };
 
         // Building a client talks to nothing, so without this a wrong endpoint or a mistyped
@@ -186,12 +214,15 @@ impl S3Provider {
         Ok(())
     }
 
-    async fn upload_in_parts(
-        &self,
-        key: &str,
-        serve: &Serve,
-        mut body: ByteStream,
-    ) -> Result<()> {
+    async fn upload_in_parts(&self, key: &str, serve: &Serve, body: ByteStream) -> Result<()> {
+        // Chosen from how big the object is. At a fixed eight megabytes a ten gigabyte upload
+        // was thirteen hundred requests; a body that will not say how long it is has to keep the
+        // smallest part, since a part size cannot be revised once the first one has gone up.
+        let part = match body.size() {
+            Some(size) => crate::parts::part_size(size, &LIMITS),
+            None => LIMITS.smallest,
+        };
+
         let started = self
             .client
             .create_multipart_upload()
@@ -211,8 +242,8 @@ impl S3Provider {
         // Several parts at once. A part number says where a part belongs, so they need not
         // arrive in order — and waiting for each one before reading the next leaves the link
         // idle for exactly as long as reading takes.
-        let sent = crate::parts::each_part(&mut body, PART_SIZE, |index, bytes| {
-            self.upload_part(key, upload_id, index as i32 + 1, bytes.into())
+        let sent = crate::parts::each_part(body, part, &self.budget, |index, bytes| {
+            self.upload_part(key, upload_id, index as i32 + 1, bytes)
         })
         .await;
 
@@ -251,13 +282,24 @@ impl S3Provider {
         Ok(())
     }
 
+    /// One part, handed over as it goes rather than as a block of memory.
+    ///
+    /// The bytes are all here already — a part has to be of stated length before the store will
+    /// take it — so this is not about holding less. It is so the client asks for the next slice
+    /// when it has room to send one, which is what lets the progress bar follow the socket.
+    ///
+    /// The cost is that the SDK cannot replay this body, so its own one retry does not apply:
+    /// it notices the body cannot be cloned and gives up after the first attempt. That retry is
+    /// done in [`crate::parts::each_part`] instead, which still has the bytes.
     async fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         number: i32,
-        bytes: Bytes,
+        part: ByteStream,
     ) -> Result<CompletedPart> {
+        let length = part.size().expect("a part, which is always of stated length");
+
         let uploaded = self
             .client
             .upload_part()
@@ -265,7 +307,8 @@ impl S3Provider {
             .key(key)
             .upload_id(upload_id)
             .part_number(number)
-            .body(AwsStream::from(bytes))
+            .content_length(length as i64)
+            .body(AwsStream::from_body_1_x(crate::body::Sending::new(part, length)))
             .send()
             .await
             .map_err(|error| failed(format!("part {number} could not be uploaded"), error))?;
@@ -274,6 +317,92 @@ impl S3Provider {
             .part_number(number)
             .set_e_tag(uploaded.e_tag().map(str::to_owned))
             .build())
+    }
+
+    /// How long the object is, asked for with a request that carries no body.
+    ///
+    /// Nothing when the store will not say. This is only deciding whether an object is worth
+    /// splitting into pieces, so a store that refuses the question is not an error here — the
+    /// download goes ahead as one request and reports for itself whatever is actually wrong.
+    async fn length_of(&self, path: &RemotePath) -> Option<u64> {
+        let head = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .send()
+            .await
+            .ok()?;
+
+        head.content_length().and_then(|length| u64::try_from(length).ok())
+    }
+
+    /// A large object, asked for as several ranges at once.
+    ///
+    /// The first piece is asked for rather than probed for. Its response says what the object is
+    /// and how long it really is — everything a HEAD would have said — and hands over a piece of
+    /// the object for the same round trip, so nothing is requested and thrown away.
+    ///
+    /// What the store says about the length beats what the caller was told. A size that has gone
+    /// stale would otherwise cut the download off at the length of a file that no longer exists.
+    async fn read_in_pieces(&self, path: &RemotePath, size: u64) -> Result<ByteStream> {
+        use futures::StreamExt as _;
+
+        // The same size a part of it would go up in, for the same reason: a request is worth
+        // making for a piece this size and not for a smaller one.
+        let piece = crate::parts::part_size(size, &LIMITS);
+        let first = self.piece(path, ByteRange::new(0, (piece as u64).min(size))).await?;
+
+        let size = first.total.unwrap_or(size);
+        let serve = first.serve;
+        let head = first.bytes;
+
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key(path);
+        let named = path.clone();
+
+        let rest = crate::parts::in_pieces(
+            head.len() as u64,
+            size,
+            piece,
+            self.budget.clone(),
+            move |range| {
+                let asking =
+                    piece_of(client.clone(), bucket.clone(), key.clone(), named.clone(), range);
+
+                async move { asking.await.map(|piece| piece.bytes) }
+            },
+        );
+
+        let chunks = futures::stream::once(async move { Ok(head) }).chain(rest);
+
+        Ok(ByteStream::new(chunks, Some(size)).served_as(serve))
+    }
+
+    async fn piece(&self, path: &RemotePath, range: ByteRange) -> Result<Piece> {
+        piece_of(
+            self.client.clone(),
+            self.bucket.clone(),
+            self.key(path),
+            path.clone(),
+            range,
+        )
+        .await
+    }
+
+    /// One object copied to another key.
+    async fn copy(&self, key: String, renamed: String) -> Result<()> {
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(encoded_source(&self.bucket, &key))
+            .key(renamed)
+            .send()
+            .await
+            .map_err(|error| failed(format!("could not copy {key}"), error))?;
+
+        Ok(())
     }
 
     /// Whether anything exists under this prefix, which is the only sense in which a folder
@@ -538,6 +667,37 @@ impl Provider for S3Provider {
     }
 
     async fn read(&self, path: &RemotePath, range: Option<ByteRange>) -> Result<ByteStream> {
+        self.read_sized(path, range, None).await
+    }
+
+    async fn read_sized(
+        &self,
+        path: &RemotePath,
+        range: Option<ByteRange>,
+        size: Option<u64>,
+    ) -> Result<ByteStream> {
+        // Something large is worth asking for in pieces, several at a time: one GET runs at
+        // whatever a single connection manages, and across a long link that is decided by the
+        // round trip rather than by the bandwidth.
+        //
+        // Only when the whole object was asked for. A caller that named a range is resuming or
+        // reading a header, and splitting that up again would be answering a different question.
+        if range.is_none() {
+            // Told, where the transfer was planned from a listing that already said. Asked for
+            // with a HEAD otherwise, which is a request with no body — where this used to send
+            // a GET, keep its headers, and throw its body away.
+            let length = match size {
+                Some(size) => Some(size),
+                None => self.length_of(path).await,
+            };
+
+            if let Some(size) = length
+                && size > IN_PIECES_ABOVE
+            {
+                return self.read_in_pieces(path, size).await;
+            }
+        }
+
         let object = self
             .client
             .get_object()
@@ -559,8 +719,17 @@ impl Provider for S3Provider {
             content_encoding: object.content_encoding().map(str::to_owned),
         };
 
-        let chunks = tokio_util::io::ReaderStream::new(object.body.into_async_read()).map(|chunk| {
-            chunk.map_err(|error| Error::caused_by("the download was interrupted", error))
+        // Taken off the response body as it arrives. Turning it into a reader and back through
+        // a `ReaderStream` would copy every chunk the connection handed over into a fresh
+        // four-kilobyte buffer, so a megabyte off the wire becomes two hundred and fifty copies
+        // and two hundred and fifty chunks for everything downstream to move one at a time.
+        let chunks = futures::stream::unfold(object.body, |mut body| async move {
+            let chunk = body
+                .next()
+                .await?
+                .map_err(|error| Error::caused_by("the download was interrupted", error));
+
+            Some((chunk, body))
         });
 
         Ok(ByteStream::new(chunks, size).served_as(serve))
@@ -582,8 +751,17 @@ impl Provider for S3Provider {
         // be held in memory all at once.
         match body.size() {
             Some(size) if size <= PART_SIZE as u64 => {
-                let bytes = body.collect().await?;
-
+                // Handed over rather than read first. Collecting it would finish the read
+                // before the request had been made, which is what made the progress bar fill
+                // up seconds before anything reached the server.
+                //
+                // The length is stated because the store will not take a body without one, and
+                // it is the reason this can be streamed at all: it came with the file.
+                //
+                // A stream cannot be replayed, so the SDK's one retry does not apply here — it
+                // notices the body cannot be cloned and gives up after the first attempt. That
+                // is the price of an honest progress bar on a file small enough to have gone up
+                // in one request.
                 self.client
                     .put_object()
                     .bucket(&self.bucket)
@@ -591,7 +769,8 @@ impl Provider for S3Provider {
                     .set_content_type(serve.content_type.clone())
                     .set_cache_control(serve.cache_control.clone())
                     .set_content_encoding(serve.content_encoding.clone())
-                    .body(AwsStream::from(bytes))
+                    .content_length(size as i64)
+                    .body(AwsStream::from_body_1_x(crate::body::Sending::new(body, size)))
                     .send()
                     .await
                     .map_err(|error| failed("could not upload", error))?;
@@ -659,24 +838,93 @@ impl Provider for S3Provider {
 
         let (source, destination) = (self.prefix(from), self.prefix(to));
 
+        // Several at once, because a copy is work the store does on its own and the whole rename
+        // is otherwise one round trip per object. And every one of them before anything is
+        // deleted — this is the only ordering here that matters, since a delete that overtakes a
+        // copy takes away the only copy there was.
+        let mut copying = Vec::with_capacity(moved.len());
+
         for key in &moved {
             let renamed = match entry.kind.is_folder() {
                 true => rebase(key, &source, &destination),
                 false => self.key(to),
             };
 
-            self.client
-                .copy_object()
-                .bucket(&self.bucket)
-                .copy_source(encoded_source(&self.bucket, key))
-                .key(renamed)
-                .send()
-                .await
-                .map_err(|error| failed(format!("could not copy {key}"), error))?;
+            copying.push(self.copy(key.clone(), renamed));
         }
+
+        futures::stream::iter(copying)
+            .buffer_unordered(COPIES_AT_ONCE)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         self.delete_keys(moved).await
     }
+}
+
+/// One range of an object, and what the response said about the object it came from.
+struct Piece {
+    bytes: Bytes,
+    serve: Serve,
+
+    /// How long the whole object is. A ranged response states it even while handing over only
+    /// part of the object, which is what makes the first piece worth asking for before anything
+    /// else — it is the answer a HEAD would have given, with a piece of the object attached.
+    ///
+    /// Nothing when the store answers `*`, which it is allowed to do.
+    total: Option<u64>,
+}
+
+async fn piece_of(
+    client: Client,
+    bucket: String,
+    key: String,
+    path: RemotePath,
+    range: ByteRange,
+) -> Result<Piece> {
+    let response = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(range.to_header())
+        .send()
+        .await
+        .map_err(|error| missing_or_refused(error, &path))?;
+
+    let serve = Serve {
+        content_type: response.content_type().map(str::to_owned),
+        cache_control: response.cache_control().map(str::to_owned),
+        content_encoding: response.content_encoding().map(str::to_owned),
+    };
+
+    let total = response.content_range().and_then(crate::parts::whole_length);
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map(|collected| collected.into_bytes())
+        .map_err(|error| Error::caused_by("the download was interrupted", error))?;
+
+    let asked = range.length.expect("a length, since every piece is asked for by one");
+
+    // What was asked for is what has to arrive, unless the store says the object ends first —
+    // which it says in the same header that gives the length, so a file shorter than it was
+    // listed as still comes down whole. Short for any other reason is a hole in the middle of
+    // the file, and a file with a hole in it is worse than a download that failed.
+    let due = match total {
+        Some(total) => asked.min(total.saturating_sub(range.offset)),
+        None => asked,
+    };
+
+    if bytes.len() as u64 != due {
+        return Err(Error::provider(format!(
+            "{path} gave back {} bytes where {due} were asked for",
+            bytes.len()
+        )));
+    }
+
+    Ok(Piece { bytes, serve, total })
 }
 
 /// The `bucket/key` a copy reads from, with the characters a URL cannot carry escaped. A key

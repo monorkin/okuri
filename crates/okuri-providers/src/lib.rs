@@ -5,6 +5,7 @@
 //! reads [`okuri_core::Capabilities`] instead.
 
 pub mod azure;
+mod body;
 pub mod destination;
 mod keys;
 mod parts;

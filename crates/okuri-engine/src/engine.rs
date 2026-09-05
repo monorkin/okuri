@@ -3,9 +3,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use okuri_core::{
-    ByteStream, Capabilities, Details, Permissions, Provider, ProviderExt, RemotePath, Visibility,
+    ByteStream, Capabilities, Details, Entry, Permissions, Provider, ProviderExt, RemotePath,
+    Visibility,
 };
 use okuri_providers::{Secret, SecretShape};
+use futures::{StreamExt, TryStreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::config::Connection;
@@ -13,7 +16,7 @@ use crate::event::{Answer, Attempt, Concern, Event, Outcome, Prompt, Question};
 use crate::known_hosts::KnownHosts;
 use crate::secrets::{SecretStore, Vault};
 use crate::session::{Session, SessionId};
-use crate::transfer::{counting, Endpoint, Place, Transfer, TransferId};
+use crate::transfer::{Endpoint, Place, Transfer, TransferId};
 use crate::trust::PromptingTrust;
 use crate::{Emitter, Error, Result};
 
@@ -677,12 +680,21 @@ impl Running {
             return Ok(());
         }
 
+        // Several at once. On an object store a rename is a copy of everything under a prefix
+        // and then a delete, so dropping a hundred files was a hundred of those one after
+        // another — and even where it is a single command, it is still a round trip each.
+        let mut renaming = Vec::with_capacity(names.len());
+
         for name in names {
-            source
-                .provider
-                .rename(&from.path.join(&name)?, &into.path.join(&name)?)
-                .await?;
+            let (here, there) = (from.path.join(&name)?, into.path.join(&name)?);
+
+            renaming.push(async move { source.provider.rename(&here, &there).await });
         }
+
+        futures::stream::iter(renaming)
+            .buffer_unordered(RENAMES_AT_ONCE)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         self.refresh(from.session).await?;
 
@@ -720,7 +732,7 @@ impl Running {
             .map(|entry| entry.name)
             .collect::<std::collections::HashSet<String>>();
 
-        let mut files = Vec::new();
+        let mut roots = Vec::new();
 
         for name in names {
             let Some(arriving) = self.arriving_as(into.session, name.clone(), &taken).await? else {
@@ -729,37 +741,20 @@ impl Running {
 
             taken.insert(arriving.clone());
 
-            self.spread(
-                source,
-                from.path.join(&name)?,
-                target,
-                into.path.join(&arriving)?,
-                &mut files,
-            )
-            .await?;
+            // Only what was dragged is asked about. Everything under a folder comes back in a
+            // listing that already says what it is and how big it is.
+            let at = from.path.join(&name)?;
+            let entry = source.provider.stat(&at).await?;
+
+            roots.push((entry, at, into.path.join(&arriving)?));
         }
 
-        for file in files {
-            let (at, to) = (file.from.clone(), file.to.clone());
-
-            let mut transfer = Transfer::new(
-                Endpoint::Remote { session: source.id, path: at.clone() },
-                Endpoint::Remote { session: target.id, path: to.clone() },
-            );
-
-            transfer.total = file.size;
-
-            let (reading, writing) = (Arc::clone(source), Arc::clone(target));
-
-            self.start(transfer, &[Arc::clone(source), Arc::clone(target)], move |progress| {
-                carry(reading, at, writing, to, file, progress)
-            });
-        }
-
-        Ok(())
+        self.spread(source, roots, target, |file| self.carry_later(source, target, file))
+            .await
     }
 
-    /// Walks the source tree, making the folders on the far side, and collects the files.
+    /// Walks the source tree, making the folders on the far side, and hands over each file as it
+    /// is found.
     ///
     /// A folder is not a thing that can be transferred, it is a shape. The folders are made
     /// even where they turn out to hold nothing, so an empty one still arrives — the same
@@ -767,24 +762,48 @@ impl Running {
     async fn spread(
         &self,
         source: &Arc<Session>,
+        roots: Vec<(Entry, RemotePath, RemotePath)>,
+        target: &Arc<Session>,
+        mut found: impl FnMut(Crossing),
+    ) -> Result<()> {
+        let mut waiting = std::collections::VecDeque::from(roots);
+        let mut listing = futures::stream::FuturesUnordered::new();
+
+        loop {
+            while listing.len() < FOLDERS_AT_ONCE
+                && let Some((entry, at, to)) = waiting.pop_front()
+            {
+                if entry.kind.is_file() {
+                    found(Crossing {
+                        permissions: entry.permissions,
+                        from: at,
+                        to,
+                        size: Some(entry.size),
+                    });
+                } else {
+                    listing.push(self.mirror(source, at, target, to));
+                }
+            }
+
+            match futures::StreamExt::next(&mut listing).await {
+                Some(children) => waiting.extend(children?),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// One folder made on the far side and then listed, in that order.
+    ///
+    /// The order is the point: a child is only ever discovered by listing its parent, so making
+    /// the parent first is what keeps a folder ahead of everything inside it however many
+    /// listings are in the air at once.
+    async fn mirror(
+        &self,
+        source: &Arc<Session>,
         at: RemotePath,
         target: &Arc<Session>,
         to: RemotePath,
-        files: &mut Vec<Crossing>,
-    ) -> Result<()> {
-        let entry = source.provider.stat(&at).await?;
-
-        if entry.kind.is_file() {
-            files.push(Crossing {
-                permissions: entry.permissions,
-                from: at,
-                to,
-                size: Some(entry.size),
-            });
-
-            return Ok(());
-        }
-
+    ) -> Result<Vec<(Entry, RemotePath, RemotePath)>> {
         // Already being there is the state this is asking for, so it is not a failure. Replacing
         // a folder is what the person answered "replace" to, and the files inside it are what
         // actually get replaced.
@@ -793,18 +812,33 @@ impl Running {
             Err(error) => return Err(error.into()),
         }
 
+        let mut children = Vec::new();
+
         for child in source.provider.list(&at).await? {
-            Box::pin(self.spread(
-                source,
-                at.join(&child.name)?,
-                target,
-                to.join(&child.name)?,
-                files,
-            ))
-            .await?;
+            let (from, into) = (at.join(&child.name)?, to.join(&child.name)?);
+
+            children.push((child, from, into));
         }
 
-        Ok(())
+        Ok(children)
+    }
+
+    /// Queues one file to cross from one connection to the other.
+    fn carry_later(self: &Arc<Self>, source: &Arc<Session>, target: &Arc<Session>, file: Crossing) {
+        let (at, to) = (file.from.clone(), file.to.clone());
+
+        let mut transfer = Transfer::new(
+            Endpoint::Remote { session: source.id, path: at.clone() },
+            Endpoint::Remote { session: target.id, path: to.clone() },
+        );
+
+        transfer.total = file.size;
+
+        let (reading, writing) = (Arc::clone(source), Arc::clone(target));
+
+        self.start(transfer, &[Arc::clone(source), Arc::clone(target)], move |progress| {
+            carry(reading, at, writing, to, file, progress)
+        });
     }
 
     async fn delete(&self, id: SessionId, names: Vec<String>) -> Result<()> {
@@ -916,78 +950,97 @@ impl Running {
     ) -> Result<()> {
         let session = self.session(id)?;
 
-        for file in self.plan(&session, names, into).await? {
-            let (source, destination) = (file.source, file.destination);
-            let mut transfer = Transfer::new(
-                Endpoint::Remote { session: id, path: source.clone() },
-                Endpoint::Local(destination.clone()),
-            );
-
-            transfer.total = file.size;
-
-            let reading = Arc::clone(&session);
-
-            self.start(transfer, std::slice::from_ref(&session), move |progress| {
-                bring_down(reading, source, destination, progress)
-            });
-        }
-
-        Ok(())
+        self.plan(&session, names, into, |file| self.bring_down_later(&session, file))
+            .await
     }
 
-    /// Turns what was asked for into the files that actually have to come down.
+    /// Turns what was asked for into the files that actually have to come down, handing over
+    /// each one as it is found.
     ///
     /// A folder is not a thing that can be transferred, it is a shape: this walks it, makes the
-    /// directories on the way, and returns the files inside. Downloading a folder is what
+    /// directories on the way, and hands over the files inside. Downloading a folder is what
     /// people mean when they drag one, so it is what dragging one does.
     async fn plan(
         &self,
         session: &Arc<Session>,
         names: Vec<String>,
         into: PathBuf,
-    ) -> Result<Vec<Planned>> {
+        mut found: impl FnMut(Planned),
+    ) -> Result<()> {
         let folder = session.path();
-        let mut files = Vec::new();
+        let mut waiting = std::collections::VecDeque::new();
 
+        // Only what was asked for is asked about. Everything below it arrives in a listing that
+        // already says what it is and how big it is, and a second question per file is a round
+        // trip per file before a single byte moves.
         for name in names {
-            self.walk(session, folder.join(&name)?, into.join(&name), &mut files)
-                .await?;
+            let source = folder.join(&name)?;
+            let entry = session.provider.stat(&source).await?;
+
+            waiting.push_back((entry, source, into.join(&name)));
         }
 
-        Ok(files)
+        let mut listing = futures::stream::FuturesUnordered::new();
+
+        loop {
+            while listing.len() < FOLDERS_AT_ONCE
+                && let Some((entry, source, destination)) = waiting.pop_front()
+            {
+                if entry.kind.is_file() {
+                    found(Planned { source, destination, size: Some(entry.size) });
+                } else {
+                    listing.push(self.children_of(session, source, destination));
+                }
+            }
+
+            match futures::StreamExt::next(&mut listing).await {
+                Some(children) => waiting.extend(children?),
+                None => return Ok(()),
+            }
+        }
     }
 
-    async fn walk(
+    /// One folder made on this machine and then listed on the server, in that order — for the
+    /// same reason [`Running::mirror`] does it in that order.
+    async fn children_of(
         &self,
         session: &Arc<Session>,
         source: RemotePath,
         destination: PathBuf,
-        files: &mut Vec<Planned>,
-    ) -> Result<()> {
-        let entry = session.provider.stat(&source).await?;
-
-        if entry.kind.is_file() {
-            files.push(Planned { source, destination, size: Some(entry.size) });
-
-            return Ok(());
-        }
-
+    ) -> Result<Vec<(Entry, RemotePath, PathBuf)>> {
         // The folder is made even when it holds nothing, so an empty one still arrives.
         tokio::fs::create_dir_all(&destination).await.map_err(|error| {
             Error::local_file(&destination, error)
         })?;
 
+        let mut children = Vec::new();
+
         for child in session.provider.list(&source).await? {
-            Box::pin(self.walk(
-                session,
-                source.join(&child.name)?,
-                destination.join(&child.name),
-                files,
-            ))
-            .await?;
+            let at = source.join(&child.name)?;
+            let into = destination.join(&child.name);
+
+            children.push((child, at, into));
         }
 
-        Ok(())
+        Ok(children)
+    }
+
+    /// Queues one file to come down.
+    fn bring_down_later(self: &Arc<Self>, session: &Arc<Session>, file: Planned) {
+        let (source, destination, size) = (file.source, file.destination, file.size);
+
+        let mut transfer = Transfer::new(
+            Endpoint::Remote { session: session.id, path: source.clone() },
+            Endpoint::Local(destination.clone()),
+        );
+
+        transfer.total = size;
+
+        let reading = Arc::clone(session);
+
+        self.start(transfer, std::slice::from_ref(session), move |progress| {
+            bring_down(reading, source, destination, size, progress)
+        });
     }
 
     /// Queues one transfer and runs it as soon as the connection has a free slot.
@@ -1144,6 +1197,27 @@ struct Planned {
 /// was never made.
 const LINK_LASTS: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How many files are renamed at once when several are dropped on one connection.
+///
+/// Bounded for the same reason the walk is: a hundred files dropped at once should not become a
+/// hundred requests at once, and on an object store each of those is itself a copy of everything
+/// under a prefix.
+const RENAMES_AT_ONCE: usize = 4;
+
+/// How many folders are being listed at once while a tree is walked.
+///
+/// A listing is nearly all round trip, so a tree of folders read one at a time is a tree read at
+/// the speed of the link's latency rather than its bandwidth. Bounded, because a drop with a
+/// thousand folders in it should not become a thousand requests at once — a server would refuse
+/// them and be right to.
+///
+/// The walk hands over each file as it finds it, so the transfers are already running while the
+/// rest of the tree is still being read. What that costs is a whole answer: a listing that fails
+/// halfway through a drop fails the walk after some files have already gone. It is reported the
+/// way any other failure is, which is the only honest thing to do — the alternative is to say
+/// nothing about the half that did not happen.
+const FOLDERS_AT_ONCE: usize = 4;
+
 /// How much of a file is read at a time on its way up.
 ///
 /// Large enough that a protocol acknowledging each write still fills the link, small enough
@@ -1173,9 +1247,7 @@ async fn send_up(
         chunk.map_err(|error| okuri_core::Error::caused_by("could not read the file", error))
     });
 
-    let body = counting(ByteStream::new(chunks, size), move |transferred| {
-        progress(transferred)
-    });
+    let body = ByteStream::new(chunks, size).counted(move |transferred| progress(transferred));
 
     Ok(session.provider.write(&destination, body).await?)
 }
@@ -1198,17 +1270,16 @@ async fn carry(
     file: Crossing,
     progress: Progress,
 ) -> Result<()> {
-    let stream = source.provider.read(&at, None).await?;
+    let stream = source.provider.read_sized(&at, None, file.size).await?;
     let known = stream.size().or(file.size);
 
     // What the source said about the file, which the download response has already told us.
     // Asking the source again would be a round trip per file for something in hand.
     let serve = stream.serve().clone();
 
-    let body = counting(
-        ByteStream::new(stream, known).served_as(serve),
-        move |transferred| progress(transferred),
-    );
+    let body = ByteStream::new(stream, known)
+        .served_as(serve)
+        .counted(move |transferred| progress(transferred));
 
     target.provider.write(&to, body).await?;
 
@@ -1226,21 +1297,31 @@ async fn bring_down(
     session: Arc<Session>,
     source: RemotePath,
     destination: PathBuf,
+    size: Option<u64>,
     progress: Progress,
 ) -> Result<()> {
-    let stream = session.provider.read(&source, None).await?;
-    let counted = counting(stream, move |transferred| progress(transferred));
-
-    let mut reader = tokio_util::io::StreamReader::new(futures::StreamExt::map(
-        counted,
-        |chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())),
-    ));
+    let stream = session.provider.read_sized(&source, None, size).await?;
+    let mut counted = stream.counted(move |transferred| progress(transferred));
 
     let mut file = tokio::fs::File::create(&destination).await.map_err(|error| {
         Error::local_file(&destination, error)
     })?;
 
-    tokio::io::copy(&mut reader, &mut file).await.map_err(|error| {
+    // Each chunk is written whole rather than through `tokio::io::copy`, whose own buffer is
+    // eight kilobytes: a quarter-megabyte chunk off the network became thirty-two writes, and
+    // every write on a `tokio::fs::File` is a hop onto the blocking pool and back.
+    while let Some(chunk) = futures::StreamExt::next(&mut counted).await {
+        let chunk = chunk?;
+
+        file.write_all(&chunk).await.map_err(|error| {
+            Error::local_file(&destination, error)
+        })?;
+    }
+
+    // A `tokio::fs::File` keeps the last write in flight on the blocking pool, and dropping one
+    // that has not been flushed drops that write with it. `copy` did this; doing it by hand
+    // means doing this too.
+    file.flush().await.map_err(|error| {
         Error::local_file(&destination, error)
     })?;
 
@@ -1251,8 +1332,434 @@ async fn bring_down(
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use okuri_core::{ByteRange, MemoryProvider};
+
     fn taken(names: &[&str]) -> std::collections::HashSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// A tree, keeping count of what it was asked and how slowly it answered.
+    struct Counting {
+        inner: MemoryProvider,
+        stats: AtomicUsize,
+        listings: AtomicUsize,
+        /// How big each read was told the file was, so it can be shown that the answer the plan
+        /// already had is the one the destination is given.
+        hints: Mutex<Vec<Option<u64>>>,
+
+        /// How long a listing of each folder takes to answer, for showing what a slow one does
+        /// and does not hold up.
+        slow: HashMap<String, std::time::Duration>,
+        /// Folders this refuses to list, for the half of a drop that goes wrong.
+        closed: std::collections::HashSet<String>,
+        /// How long a rename takes to answer, and how many were in the air at once.
+        slow_renames: Option<std::time::Duration>,
+        renaming: AtomicUsize,
+        renames_at_once: AtomicUsize,
+        /// How many listings are in the air now, and the most there have ever been at once.
+        listing: AtomicUsize,
+        at_once: AtomicUsize,
+        /// What happened, in the order it happened, so a file found early can be told apart
+        /// from one found once the walk was over.
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Counting {
+        fn sample() -> Self {
+            Self::around(MemoryProvider::sample())
+        }
+
+        fn around(inner: MemoryProvider) -> Self {
+            Self {
+                inner,
+                stats: AtomicUsize::new(0),
+                listings: AtomicUsize::new(0),
+                hints: Mutex::new(Vec::new()),
+                slow: HashMap::new(),
+                closed: std::collections::HashSet::new(),
+                slow_renames: None,
+                renaming: AtomicUsize::new(0),
+                renames_at_once: AtomicUsize::new(0),
+                listing: AtomicUsize::new(0),
+                at_once: AtomicUsize::new(0),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn renaming_slowly(mut self, waiting: std::time::Duration) -> Self {
+            self.slow_renames = Some(waiting);
+            self
+        }
+
+        fn listing_slowly(mut self, folder: &str, waiting: std::time::Duration) -> Self {
+            self.slow.insert(folder.to_owned(), waiting);
+            self
+        }
+
+        fn refusing(mut self, folder: &str) -> Self {
+            self.closed.insert(folder.to_owned());
+            self
+        }
+
+        fn note(&self, what: impl Into<String>) {
+            self.log.lock().unwrap().push(what.into());
+        }
+
+        fn happened(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Counting {
+        fn label(&self) -> String {
+            self.inner.label()
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+
+        async fn list(&self, path: &RemotePath) -> okuri_core::Result<Vec<Entry>> {
+            self.listings.fetch_add(1, Ordering::SeqCst);
+
+            let now = self.listing.fetch_add(1, Ordering::SeqCst) + 1;
+            self.at_once.fetch_max(now, Ordering::SeqCst);
+
+            if let Some(waiting) = self.slow.get(&path.to_string()) {
+                tokio::time::sleep(*waiting).await;
+            }
+
+            let listed = match self.closed.contains(&path.to_string()) {
+                true => Err(okuri_core::Error::provider(format!("{path} could not be read"))),
+                false => self.inner.list(path).await,
+            };
+
+            self.listing.fetch_sub(1, Ordering::SeqCst);
+            self.note(format!("listed {path}"));
+
+            listed
+        }
+
+        async fn stat(&self, path: &RemotePath) -> okuri_core::Result<Entry> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            self.inner.stat(path).await
+        }
+
+        async fn read(
+            &self,
+            path: &RemotePath,
+            range: Option<ByteRange>,
+        ) -> okuri_core::Result<ByteStream> {
+            self.inner.read(path, range).await
+        }
+
+        async fn read_sized(
+            &self,
+            path: &RemotePath,
+            range: Option<ByteRange>,
+            size: Option<u64>,
+        ) -> okuri_core::Result<ByteStream> {
+            self.hints.lock().unwrap().push(size);
+            self.inner.read_sized(path, range, size).await
+        }
+
+        async fn write(&self, path: &RemotePath, body: ByteStream) -> okuri_core::Result<()> {
+            self.inner.write(path, body).await
+        }
+
+        async fn delete(&self, path: &RemotePath) -> okuri_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn create_folder(&self, path: &RemotePath) -> okuri_core::Result<()> {
+            self.inner.create_folder(path).await
+        }
+
+        async fn rename(&self, from: &RemotePath, to: &RemotePath) -> okuri_core::Result<()> {
+            let now = self.renaming.fetch_add(1, Ordering::SeqCst) + 1;
+            self.renames_at_once.fetch_max(now, Ordering::SeqCst);
+
+            if let Some(waiting) = self.slow_renames {
+                tokio::time::sleep(waiting).await;
+            }
+
+            let renamed = self.inner.rename(from, to).await;
+            self.renaming.fetch_sub(1, Ordering::SeqCst);
+
+            renamed
+        }
+    }
+
+    fn engine() -> Running {
+        Running {
+            emit: Arc::new(|_| {}),
+            secrets: Arc::new(Vault::open(Arc::new(crate::secrets::InMemory::default()))),
+            known_hosts: PathBuf::new(),
+            sessions: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Everything the walk hands over, in the order it handed it over.
+    async fn planning(engine: &Running, session: &Arc<Session>, names: &[&str], into: &std::path::Path) -> Vec<(String, Option<u64>)> {
+        let mut found = Vec::new();
+
+        engine
+            .plan(
+                session,
+                names.iter().map(|name| (*name).to_owned()).collect(),
+                into.to_path_buf(),
+                |file| found.push((file.source.to_string(), file.size)),
+            )
+            .await
+            .unwrap();
+
+        found
+    }
+
+    /// An engine with one connection already open, which is what everything that redraws a
+    /// folder afterwards expects to find.
+    fn engine_with(session: &Arc<Session>) -> Running {
+        let engine = engine();
+        engine.sessions.lock().unwrap().insert(session.id, Arc::clone(session));
+
+        engine
+    }
+
+    /// Two folders and a handful of files to move between them.
+    fn several_files() -> MemoryProvider {
+        let provider = MemoryProvider::new("Several");
+
+        provider.seed_folder("/from");
+        provider.seed_folder("/to");
+
+        for name in NAMES {
+            provider.seed_file(&format!("/from/{name}"), b"a file".as_slice());
+        }
+
+        provider
+    }
+
+    const NAMES: [&str; 6] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"];
+
+    /// A drop onto the same connection renames rather than copies, and on an object store a
+    /// rename is a copy of everything under a prefix followed by a delete. One after another,
+    /// dropping six files was six of those in a row.
+    #[tokio::test]
+    async fn several_files_dropped_on_one_connection_are_renamed_several_at_a_time() {
+        let provider = Arc::new(
+            Counting::around(several_files())
+                .renaming_slowly(std::time::Duration::from_millis(50)),
+        );
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+
+        let from = Place::new(session.id, RemotePath::parse("/from").unwrap());
+        let into = Place::new(session.id, RemotePath::parse("/to").unwrap());
+
+        engine_with(&session)
+            .rename_into(&session, &from, NAMES.iter().map(|name| (*name).to_owned()).collect(), &into)
+            .await
+            .unwrap();
+
+        assert_eq!(provider.renames_at_once.load(Ordering::SeqCst), RENAMES_AT_ONCE);
+
+        let arrived = provider.list(&into.path).await.unwrap();
+        let names = arrived.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(names, NAMES);
+    }
+
+    /// A listing already says what each child is and how big it is, so asking again is a round
+    /// trip per file — thousands of them, before a single byte moves — for an answer in hand.
+    #[tokio::test]
+    async fn planning_a_download_asks_only_about_what_was_dragged() {
+        let provider = Arc::new(Counting::sample());
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+        let into = tempfile::tempdir().unwrap();
+
+        let files = planning(&engine(), &session, &["documents"], into.path()).await;
+
+        assert_eq!(
+            files,
+            vec![
+                ("/documents/notes.txt".to_owned(), Some(17)),
+                ("/documents/invoices/2026-08.pdf".to_owned(), Some(4096)),
+            ]
+        );
+
+        // The folder that was dragged, and nothing under it.
+        assert_eq!(provider.stats.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.listings.load(Ordering::SeqCst), 2);
+    }
+
+    /// A tree of folders, one of which answers slowly.
+    fn branching() -> MemoryProvider {
+        let provider = MemoryProvider::new("Branching");
+
+        for branch in ["one", "two", "three", "four", "five", "six"] {
+            provider.seed_folder(&format!("/{branch}"));
+            provider.seed_file(&format!("/{branch}/note.txt"), b"a note".as_slice());
+        }
+
+        provider
+    }
+
+    /// Nothing moves until the whole tree has been walked, and a tree is walked one round trip
+    /// per folder — so a slow folder used to hold up files that had already been found. The
+    /// walk hands each file over as it turns up instead.
+    #[tokio::test]
+    async fn a_file_is_handed_over_before_the_slow_part_of_the_tree_has_been_read() {
+        let provider = Arc::new(
+            Counting::around(branching())
+                .listing_slowly("/one", std::time::Duration::from_millis(200)),
+        );
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+        let into = tempfile::tempdir().unwrap();
+
+        let mut found = Vec::new();
+
+        engine()
+            .plan(
+                &session,
+                vec!["one".to_owned(), "two".to_owned()],
+                into.path().to_path_buf(),
+                |file| {
+                    provider.note(format!("found {}", file.source));
+                    found.push(file.source.to_string());
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.happened(),
+            vec![
+                "listed /two".to_owned(),
+                "found /two/note.txt".to_owned(),
+                "listed /one".to_owned(),
+                "found /one/note.txt".to_owned(),
+            ]
+        );
+    }
+
+    /// Several folders at once, because a listing is nearly all round trip — but a bounded
+    /// several, because a drop with a thousand folders in it should not become a thousand
+    /// requests at once.
+    #[tokio::test]
+    async fn no_more_folders_are_listed_at_once_than_the_bound_allows() {
+        let mut slow = Counting::around(branching());
+
+        for branch in ["one", "two", "three", "four", "five", "six"] {
+            slow = slow.listing_slowly(&format!("/{branch}"), std::time::Duration::from_millis(50));
+        }
+
+        let provider = Arc::new(slow);
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+        let into = tempfile::tempdir().unwrap();
+
+        let names = ["one", "two", "three", "four", "five", "six"];
+        let files = planning(&engine(), &session, &names, into.path()).await;
+
+        assert_eq!(files.len(), 6);
+        assert_eq!(provider.at_once.load(Ordering::SeqCst), FOLDERS_AT_ONCE);
+    }
+
+    /// A tree that cannot be read all the way through has still handed over whatever it read
+    /// first, and saying nothing about the rest would leave a half-finished drop looking
+    /// finished.
+    #[tokio::test]
+    async fn a_listing_that_fails_is_reported_even_once_files_have_been_handed_over() {
+        let provider = Arc::new(
+            Counting::around(branching())
+                .listing_slowly("/two", std::time::Duration::from_millis(100))
+                .refusing("/two"),
+        );
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+        let into = tempfile::tempdir().unwrap();
+
+        let mut found = Vec::new();
+
+        let refused = engine()
+            .plan(
+                &session,
+                vec!["one".to_owned(), "two".to_owned()],
+                into.path().to_path_buf(),
+                |file| found.push(file.source.to_string()),
+            )
+            .await;
+
+        assert_eq!(found, vec!["/one/note.txt".to_owned()]);
+        assert_eq!(refused.unwrap_err().to_string(), "/two could not be read");
+    }
+
+    /// The plan already knows how long every file is, and on SFTP finding out again is a round
+    /// trip before the download can start. So the answer travels with the transfer.
+    #[tokio::test]
+    async fn a_download_tells_the_destination_how_long_the_file_is() {
+        let provider = Arc::new(Counting::sample());
+        let session = Arc::new(Session::new("Scratch", Arc::clone(&provider) as Arc<dyn Provider>));
+        let into = tempfile::tempdir().unwrap();
+        let destination = into.path().join("notes.txt");
+
+        bring_down(
+            session,
+            RemotePath::parse("/documents/notes.txt").unwrap(),
+            destination.clone(),
+            Some(17),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*provider.hints.lock().unwrap(), vec![Some(17)]);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"remember the milk");
+    }
+
+    /// The same for a drag from one connection to another, which walks the tree the same way.
+    #[tokio::test]
+    async fn carrying_a_folder_across_asks_only_about_what_was_dragged() {
+        let source = Arc::new(Counting::sample());
+        let reading = Arc::new(Session::new("Source", Arc::clone(&source) as Arc<dyn Provider>));
+        let writing = Arc::new(Session::new(
+            "Target",
+            Arc::new(MemoryProvider::new("Target")) as Arc<dyn Provider>,
+        ));
+
+        let at = RemotePath::parse("/documents").unwrap();
+        let entry = source.stat(&at).await.unwrap();
+        let mut crossing = Vec::new();
+
+        engine()
+            .spread(
+                &reading,
+                vec![(entry, at, RemotePath::parse("/moved").unwrap())],
+                &writing,
+                |file| crossing.push((file.from.to_string(), file.to.to_string(), file.size)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crossing,
+            vec![
+                (
+                    "/documents/notes.txt".to_owned(),
+                    "/moved/notes.txt".to_owned(),
+                    Some(17)
+                ),
+                (
+                    "/documents/invoices/2026-08.pdf".to_owned(),
+                    "/moved/invoices/2026-08.pdf".to_owned(),
+                    Some(4096)
+                ),
+            ]
+        );
+
+        // Only the one this test asked for itself.
+        assert_eq!(source.stats.load(Ordering::SeqCst), 1);
     }
 
     #[test]

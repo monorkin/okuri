@@ -24,6 +24,25 @@ pub trait Provider: Send + Sync {
 
     async fn read(&self, path: &RemotePath, range: Option<ByteRange>) -> Result<ByteStream>;
 
+    /// [`read`](Provider::read), for a caller that already knows how long the file is.
+    ///
+    /// A hint rather than a promise, and one every destination is free to ignore — most do,
+    /// because the response they are about to make states the length anyway. It is here for the
+    /// ones where finding out costs a round trip of its own: a transfer is planned from a
+    /// listing that has already said how big every file is, and asking the server again per file
+    /// is that listing paid for a second time, thousands of round trips before a byte moves.
+    ///
+    /// A destination that acts on the hint has to notice a file that does not match it and say
+    /// so. A download that quietly stops short is worse than one that fails.
+    async fn read_sized(
+        &self,
+        path: &RemotePath,
+        range: Option<ByteRange>,
+        _size: Option<u64>,
+    ) -> Result<ByteStream> {
+        self.read(path, range).await
+    }
+
     async fn write(&self, path: &RemotePath, body: ByteStream) -> Result<()>;
 
     async fn delete(&self, path: &RemotePath) -> Result<()>;

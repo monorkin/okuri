@@ -50,7 +50,12 @@ const LISTING_REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 
 impl WebDavProvider {
     pub async fn connect(config: &WebDavConfig, secret: &Secret) -> Result<Self> {
+        // The window is what the server may send before it has to stop and be told the bytes
+        // were taken, and HTTP/2's default is a fixed sixty-four kilobytes. Across a long link
+        // that alone caps a download at a window per round trip however fast the line is.
+        // Letting it grow is the whole difference on exactly the connections that need it.
         let client = Client::builder()
+            .http2_adaptive_window(true)
             .build()
             .map_err(|error| Error::caused_by("could not start an HTTP client", error))?;
 
@@ -185,7 +190,14 @@ impl Provider for WebDavProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::filesystem()
+        Capabilities {
+            // More than a filesystem's four, fewer than an object store's two dozen. This is
+            // HTTP, so every transfer is a request of its own and the server is built to answer
+            // several at once — but it is usually one machine holding one disk behind it, not a
+            // store designed to be asked a hundred things at a time.
+            transfer_slots: 8,
+            ..Capabilities::filesystem()
+        }
     }
 
     async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>> {

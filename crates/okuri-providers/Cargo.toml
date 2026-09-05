@@ -15,11 +15,11 @@ russh = "0.63"
 russh-sftp = "2.4"
 serde = { version = "1", features = ["derive"] }
 time.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt"] }
-tokio-util = { version = "0.7", features = ["compat", "io"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
 aws-sdk-s3 = "1.144.0"
 aws-config = "1.11.0"
-aws-smithy-types = "1.6.2"
+aws-smithy-types = { version = "1.6.2", features = ["http-body-1-x"] }
+http-body = "1"
 quick-xml = "0.42.0"
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "rustls", "stream"] }

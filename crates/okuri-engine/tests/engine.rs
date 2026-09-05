@@ -818,7 +818,12 @@ fn a_question_says_which_connection_it_is_holding_up() {
         prompt.answer(Answer::Decline);
     }
 
-    asked.sort_by_key(|concern| format!("{concern:?}"));
+    // By the attempt's number, not its debug text: the counter is shared by every test in the
+    // binary, and as text `Attempt(10)` sorts before `Attempt(9)`.
+    asked.sort_by_key(|concern| match concern {
+        Concern::Attempt(attempt) => attempt.0,
+        _ => 0,
+    });
 
     assert_eq!(asked, vec![Concern::Attempt(ours), Concern::Attempt(theirs)]);
 }

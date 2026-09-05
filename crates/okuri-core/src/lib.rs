@@ -26,4 +26,4 @@ pub use path::RemotePath;
 pub use permitting::Permitting;
 pub use provider::{Provider, ProviderExt};
 pub use sharing::{Sharing, Visibility};
-pub use stream::{ByteRange, ByteStream, Serve};
+pub use stream::{ByteRange, ByteStream, Progress, Serve};
