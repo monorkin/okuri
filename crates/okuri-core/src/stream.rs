@@ -152,6 +152,10 @@ pub struct ByteStream {
     len: Option<u64>,
     serve: Serve,
     progress: Option<Progress>,
+    /// Whether the chunks have run out. Remembered here because whatever is sending them —
+    /// an HTTP client, a file writer — asks again after the end, and an unfolded stream asked
+    /// past its end panics rather than answering.
+    finished: bool,
 }
 
 impl ByteStream {
@@ -159,7 +163,13 @@ impl ByteStream {
         chunks: impl Stream<Item = Result<Bytes>> + Send + 'static,
         len: Option<u64>,
     ) -> Self {
-        Self { chunks: Box::pin(chunks), len, serve: Serve::default(), progress: None }
+        Self {
+            chunks: Box::pin(chunks),
+            len,
+            serve: Serve::default(),
+            progress: None,
+            finished: false,
+        }
     }
 
     /// Says how the file these bytes make up should be handed out.
@@ -241,12 +251,21 @@ impl Stream for ByteStream {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let stream = self.get_mut();
+
+        if stream.finished {
+            return Poll::Ready(None);
+        }
+
         let polled = stream.chunks.as_mut().poll_next(context);
 
-        if let Poll::Ready(Some(Ok(chunk))) = &polled
-            && let Some(progress) = &stream.progress
-        {
-            progress.read(chunk.len() as u64);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(progress) = &stream.progress {
+                    progress.read(chunk.len() as u64);
+                }
+            }
+            Poll::Ready(None) => stream.finished = true,
+            _ => {}
         }
 
         polled
@@ -290,6 +309,24 @@ impl ByteRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever sends the bytes asks again after the last of them, and an unfolded stream asked
+    /// past its end panics. Seen for real: uploads to R2 dying in a worker thread on it.
+    #[tokio::test]
+    async fn a_stream_asked_past_its_end_answers_with_the_end_again() {
+        let past_the_end = futures::stream::unfold(2u8, |left| async move {
+            match left {
+                0 => None,
+                left => Some((Ok(Bytes::from_static(b"x")), left - 1)),
+            }
+        });
+        let mut stream = ByteStream::new(past_the_end, Some(2));
+
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
 
     #[test]
     fn ranges_render_as_http_headers() {
